@@ -1,0 +1,20 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "同人小说抓取与翻译助手"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "同人小说抓取与翻译助手"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "同人译站"
+    },
+    {
+      "name": "reason_internet",
+      "value": "用于访问同人站点与调用翻译服务"
+    }
+  ]
+}

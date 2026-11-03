@@ -1,0 +1,10 @@
+{
+  "src": [
+    "pages/Bookshelf",
+    "pages/ImportPage",
+    "pages/SearchPage",
+    "pages/Reader",
+    "pages/SettingsPage",
+    "pages/TermPage"
+  ]
+}

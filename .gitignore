@@ -1,0 +1,30 @@
+# Dependency directories
+node_modules/
+oh_modules/
+
+# Local IDE configuration
+/local.properties
+.idea/
+
+# Build and test outputs
+build/
+.hvigor/
+.preview/
+.test/
+/.appanalyzer
+
+# Local signing materials
+*.p12
+*.pfx
+*.p7b
+*.cer
+*.keystore
+*.jks
+*.key
+
+# Generated pipeline artifacts
+/output/
+
+# Agent workspace & temp files
+/.workbuddy/
+/.tmp_txt/
