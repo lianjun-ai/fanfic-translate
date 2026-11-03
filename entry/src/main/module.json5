@@ -48,13 +48,21 @@
               "ohos.want.action.sendData"
             ],
             "uris": [
+              // maxFileSupported 缺省为 0，等于不接收该类型——分享面板里就不会出现本应用，必须显式声明
               {
                 "utd": "general.hyperlink",
-                "scheme": "https"
+                "scheme": "https",
+                "maxFileSupported": 1
               },
               {
                 "utd": "general.text",
-                "scheme": "https"
+                "scheme": "https",
+                "maxFileSupported": 1
+              },
+              {
+                "utd": "general.plain-text",
+                "scheme": "https",
+                "maxFileSupported": 1
               }
             ]
           }
