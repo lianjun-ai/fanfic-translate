@@ -1,7 +1,8 @@
 import { fileIo as fs } from '@kit.CoreFileKit';
-import { http } from '@kit.NetworkKit';
 import { ToolDef } from '../provider/LlmProvider';
 import { FicHub, FicMeta, ProbeResult } from './FicHub';
+import { HttpFetch } from './HttpFetch';
+import { WebChapter, WebPageFetched, WebToBook } from './WebToBook';
 import { PendingItem, PendingStore } from './PendingStore';
 import { Tavily, TavilyHit } from './Tavily';
 import { WebPage, PageResult } from './WebPage';
@@ -18,7 +19,8 @@ import { Log } from '../common/Logger';
  * 能力边界：
  * - web_search    发现线索（便宜）
  * - fetch_page    自己看网页内容（便宜，能判断链接是不是目标作品）
- * - fichub_get    把作品页变成 EPUB 放进待入库区（一步到位，内部先短超时探缓存、没命中就续等现场转换）
+ * - fichub_get    把作品页变成 EPUB 放进待入库区（英文同文库一步到位）
+ * - html_to_book  把静态网页（单页或多页连载）抓成本地书（FicHub 不支持的站点的兜底路）
  * - download_file 直接下载任意文件（便宜，适合已经拿到直链）
  *
  * FicHub 只是其中一个可选工具 —— 模型完全可以只用 download_file 拿直链，
@@ -27,16 +29,6 @@ import { Log } from '../common/Logger';
  * 不设下载数量上限：下多少本由用户和模型的对话决定，需要清理时用户
  * 自己在待入库区移除。唯一的预算是单回合步数（见 FinderTypes.MAX_ROUNDS）。
  */
-
-/** 一次回合里工具执行的可变状态 */
-export interface FinderState {
-  hits: FicMeta[];
-  downloaded: PendingItem[];
-  /** 已确认可转换的 url → 元信息，convert 复用，避免重复请求 FicHub */
-  probed: Record<string, FicMeta>;
-  /** 当前是第几轮（由主循环每轮开头写入），工具据此算出还剩几步 */
-  round: number;
-}
 
 /**
  * 工具回填里的预算字段：让模型看得见自己还剩几步。
@@ -85,17 +77,15 @@ interface PageReply {
   hint: string;
 }
 
-interface DlResult {
-  ok: boolean;
-  path: string;
-  contentType: string;
-  bytes: number;
-  note: string;
+/** 一次回合里工具执行的可变状态 */
+export interface FinderState {
+  hits: FicMeta[];
+  downloaded: PendingItem[];
+  /** 已确认可转换的 url → 元信息，convert 复用，避免重复请求 FicHub */
+  probed: Record<string, FicMeta>;
+  /** 当前是第几轮（由主循环每轮开头写入），工具据此算出还剩几步 */
+  round: number;
 }
-
-const UA: string = 'Mozilla/5.0 (Linux; HarmonyOS) AppleWebKit/537.36 (KHTML, like Gecko) Mobile Safari/537.36';
-/** 单文件下载上限，超过直接拒绝（同人文 EPUB 通常几 MB） */
-const MAX_DOWNLOAD_BYTES: number = 60 * 1024 * 1024;
 
 export class FinderTools {
   static newState(): FinderState {
@@ -162,7 +152,16 @@ export class FinderTools {
         parameters: dlParams
       }
     };
-    return [webSearch, fetchPage, probe, download];
+    const webBook: ToolDef = {
+      type: 'function',
+      function: {
+        name: 'html_to_book',
+        description: '把网页抓成本地书放进待入库区（FicHub 不支持的站点的兜底路，如 LOFTER、晋江免费章节、博客、论坛帖子串）。urls 按阅读顺序传数组，每个网页合成一章；只抓一个网页时也可以只传一个元素的数组。只对「网页源码里就有正文」的静态页面有效，需要登录、JS 动态渲染或强反爬的页面会抓不到正文而失败',
+        parameters: JSON.parse(
+          '{"type":"object","properties":{"urls":{"type":"array","items":{"type":"string"},"description":"按阅读顺序排列的网页地址，1~30 个"},"title":{"type":"string","description":"书名，不填就用第一个网页的标题"},"author":{"type":"string","description":"作者"}},"required":["urls"]}')
+      }
+    };
+    return [webSearch, fetchPage, probe, webBook, download];
   }
 
   /** 执行一次工具调用，返回喂回模型的 JSON */
@@ -175,6 +174,9 @@ export class FinderTools {
     }
     if (name === 'fichub_get') {
       return FinderTools.fichubGet(args, ctx, st);
+    }
+    if (name === 'html_to_book') {
+      return FinderTools.htmlToBook(args, ctx, st);
     }
     if (name === 'download_file') {
       return FinderTools.downloadFile(args, ctx, st);
@@ -331,12 +333,12 @@ export class FinderTools {
     const authorArg = FinderTools.str(args, 'author');
     ctx.hooks.onAction(`⬇️ 下载：${url}`);
     ctx.hooks.onStatus('正在下载文件…');
-    const res = await FinderTools.fetchFile(url, ctx);
+    const res = await HttpFetch.toFile(url, `${ctx.ui.cacheDir}/finder_dl`);
     if (!res.ok) {
       ctx.hooks.onAction(`　　下载失败：${res.note}`);
       return FinderTools.reply('fail', res.note, null, '', st);
     }
-    const kind = FinderTools.extOf(url, res.contentType);
+    const kind = HttpFetch.extOf(url, res.contentType);
     if (kind.length === 0) {
       ctx.hooks.onAction(`　　已下载 ${res.bytes} 字节，但不是电子书格式`);
       return FinderTools.reply('saved',
@@ -367,50 +369,102 @@ export class FinderTools {
     }
   }
 
-  /** 通用文件下载：落到临时目录，由调用方决定是否入库 */
-  private static async fetchFile(url: string, ctx: FinderCtx): Promise<DlResult> {
-    const dir = `${ctx.ui.cacheDir}/finder_dl`;
-    if (!fs.accessSync(dir)) {
-      fs.mkdirSync(dir, true);
+  /**
+   * 网页抓书：把一个或多个静态网页抓成本地书放进待入库区。
+   *
+   * 这是 FicHub 不支持站点（LOFTER、晋江免费章、博客、论坛等）的兜底路：
+   * 走与本地 HTML 导入同一条解析管线抽正文，多页按顺序拼成多章。
+   * 抓不到正文时把原因和替代方案（分享链接/复制正文）一起交给模型。
+   */
+  private static async htmlToBook(args: Record<string, Object>, ctx: FinderCtx, st: FinderState): Promise<string> {
+    const urls = FinderTools.urlList(args);
+    if (urls.length === 0) {
+      return FinderTools.reply('bad_args', '缺少 urls 参数（要抓的网页地址数组）', null, '', st);
     }
-    const req = http.createHttp();
+    if (urls.length > 30) {
+      return FinderTools.reply('bad_args', `一次最多抓 30 个网页（收到 ${urls.length} 个），拆成几本书分次抓`, null, '', st);
+    }
+    // 与 fichub_get 相同的去重约定：sourceUrl 记第一个网页，重复请求直接命中
+    const already = await PendingStore.list(ctx.ui);
+    for (let i = 0; i < already.length; i++) {
+      if (already[i].sourceUrl === urls[0]) {
+        const hit: FicMeta = {
+          title: already[i].title, author: already[i].author, chapters: already[i].chapters,
+          words: already[i].words, info: already[i].info, epubUrl: '', sourceUrl: urls[0]
+        };
+        ctx.hooks.onAction(`　　《${hit.title}》已经下过了，跳过重复抓取`);
+        return FinderTools.reply('ok', '这本之前已经抓过了，就在待入库区，等用户点一下就进书架', hit,
+          already[i].epubPath, st);
+      }
+    }
+    ctx.hooks.onAction(`📄 抓网页成书：${urls.length} 个页面`);
+    const dir = `${ctx.ui.cacheDir}/finder_dl`;
+    const pages: WebPageFetched[] = [];
+    const failedNotes: string[] = [];
+    let totalChars = 0;
+    for (let i = 0; i < urls.length; i++) {
+      ctx.hooks.onStatus(urls.length > 1 ? `正在抓取第 ${i + 1}/${urls.length} 页…` : '正在抓取网页…');
+      const p = await WebToBook.fetchPage(urls[i], dir);
+      if (p.ok) {
+        pages.push(p);
+        totalChars += p.chars;
+        ctx.hooks.onAction(`　　第 ${i + 1} 页「${p.title.length > 0 ? p.title : urls[i]}」：约 ${p.chars} 字${p.note.length > 0 ? `（${p.note}）` : ''}`);
+      } else {
+        failedNotes.push(`第 ${i + 1} 个（${urls[i]}）：${p.note}`);
+        ctx.hooks.onAction(`　　第 ${i + 1} 页抓取失败：${p.note}`);
+      }
+    }
+    if (pages.length === 0) {
+      const why = failedNotes.join('；');
+      return FinderTools.reply('fail',
+        `所有页面都没抓到正文。${why}。这类页面通常需要登录或是 JS 动态渲染（微博、小红书等），` +
+        '可以建议用户：在浏览器里打开文章、等正文显示后把链接分享给本应用，或复制正文存成 TXT 从「导入本地文件」进来',
+        null, '', st);
+    }
+    const titleArg = FinderTools.str(args, 'title');
+    const workTitle = titleArg.length > 0 ? titleArg
+      : (pages[0].title.length > 0 ? pages[0].title : '未命名作品');
+    const authorArg = FinderTools.str(args, 'author');
+    const chapters: WebChapter[] = [];
+    for (let i = 0; i < pages.length; i++) {
+      const p = pages[i];
+      // 多页时每页一章，章名用页面标题；单页时章名就是书名
+      const name = pages.length > 1
+        ? (p.title.length > 0 ? p.title : `第 ${chapters.length + 1} 章`)
+        : workTitle;
+      chapters.push({ title: name, paragraphs: p.paragraphs });
+    }
+    const html = WebToBook.buildHtml(workTitle, chapters);
+    const path = `${dir}/web_${Date.now()}.html`;
+    const file = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
     try {
-      const header: Record<string, string> = { 'Accept': '*/*', 'User-Agent': UA };
-      const options: http.HttpRequestOptions = {
-        method: http.RequestMethod.GET,
-        header: header,
-        expectDataType: http.HttpDataType.ARRAY_BUFFER,
-        connectTimeout: 15000,
-        readTimeout: 120000
-      };
-      const resp = await req.request(url, options);
-      if (resp.responseCode < 200 || resp.responseCode >= 300) {
-        return { ok: false, path: '', contentType: '', bytes: 0, note: `HTTP ${resp.responseCode}` };
-      }
-      const buf = resp.result as ArrayBuffer;
-      if (buf.byteLength === 0) {
-        return { ok: false, path: '', contentType: '', bytes: 0, note: '下载到的文件是空的' };
-      }
-      if (buf.byteLength > MAX_DOWNLOAD_BYTES) {
-        return { ok: false, path: '', contentType: '', bytes: buf.byteLength, note: '文件超过 60MB，已放弃' };
-      }
-      const ct = FinderTools.headerOf(resp, 'content-type');
-      const ext = FinderTools.extOf(url, ct);
-      const path = `${dir}/dl_${Date.now()}_${buf.byteLength}.${ext.length > 0 ? ext : 'bin'}`;
-      const file = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      try {
-        fs.writeSync(file.fd, buf);
-      } finally {
-        fs.closeSync(file);
-      }
-      Log.i(`直接下载完成：${path}（${buf.byteLength} 字节，${ct}）`);
-      return { ok: true, path: path, contentType: ct, bytes: buf.byteLength, note: '' };
-    } catch (e) {
-      const raw = (e as Error).message;
-      const timeout = raw.includes('timeout') || raw.includes('Timeout');
-      return { ok: false, path: '', contentType: '', bytes: 0, note: timeout ? '下载超时' : `网络错误：${raw}` };
+      fs.writeSync(file.fd, html);
     } finally {
-      req.destroy();
+      fs.closeSync(file);
+    }
+    const meta: FicMeta = {
+      title: workTitle,
+      author: authorArg,
+      chapters: pages.length,
+      words: totalChars,
+      info: urls.length > 1 ? `网页抓取 · ${pages.length}/${urls.length} 页` : '网页抓取',
+      epubUrl: '',
+      sourceUrl: urls[0]
+    };
+    try {
+      const item: PendingItem = await PendingStore.save(ctx.ui, meta, path);
+      st.hits.push(meta);
+      st.downloaded.push(item);
+      ctx.hooks.onHit(meta);
+      ctx.hooks.onAction(`📥 已抓成书：《${workTitle}》（待入库，${pages.length} 章）`);
+      ctx.hooks.onDownloaded(item);
+      const note = pages.length < urls.length
+        ? `已放进待入库区（${urls.length - pages.length} 个页面抓取失败：${failedNotes.join('；')}）`
+        : '已放进待入库区，用户确认后才会进书架';
+      return FinderTools.reply('ok', note, meta, item.epubPath, st);
+    } catch (e) {
+      const why = (e as Error).message;
+      return FinderTools.reply('fail', `网页已抓取但入库失败：${why}`, null, path, st);
     }
   }
 
@@ -449,40 +503,26 @@ export class FinderTools {
     return def;
   }
 
-  private static headerOf(resp: http.HttpResponse, key: string): string {
-    try {
-      const h = JSON.parse(JSON.stringify(resp.header)) as Record<string, string>;
-      const keys = Object.keys(h);
-      for (let i = 0; i < keys.length; i++) {
-        if (keys[i].toLowerCase() === key) {
-          return h[keys[i]];
+  /** 从参数里取 URL 列表：urls 数组优先，兼容模型把单个地址塞进 url 字段 */
+  private static urlList(args: Record<string, Object>): string[] {
+    const out: string[] = [];
+    const v = args['urls'];
+    if (Array.isArray(v)) {
+      const arr = v as string[];
+      for (let i = 0; i < arr.length; i++) {
+        const e = arr[i];
+        if (typeof e === 'string' && e.trim().length > 0) {
+          out.push(e.trim());
         }
       }
-    } catch (e) {
-      Log.d('响应头解析失败');
     }
-    return '';
-  }
-
-  /** 从 URL 或 Content-Type 推断电子书格式，认不出返回空串 */
-  private static extOf(url: string, contentType: string): string {
-    const lower = url.toLowerCase();
-    const q = lower.indexOf('?');
-    const clean = q >= 0 ? lower.substring(0, q) : lower;
-    if (clean.endsWith('.epub')) {
-      return 'epub';
+    if (out.length === 0) {
+      const one = FinderTools.str(args, 'url');
+      if (one.length > 0) {
+        out.push(one);
+      }
     }
-    if (clean.endsWith('.txt')) {
-      return 'txt';
-    }
-    const ct = contentType.toLowerCase();
-    if (ct.indexOf('epub') >= 0) {
-      return 'epub';
-    }
-    if (ct.indexOf('text/plain') >= 0) {
-      return 'txt';
-    }
-    return '';
+    return out;
   }
 
   private static baseName(path: string): string {
