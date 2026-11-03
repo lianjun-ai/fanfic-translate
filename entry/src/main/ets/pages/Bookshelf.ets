@@ -1,8 +1,9 @@
 import { promptAction, window } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
-import { Shelf, Work } from '../model/Models';
+import { Shelf, Work, Chapter } from '../model/Models';
 import { WorkDao } from '../data/WorkDao';
 import { ShelfDao } from '../data/ShelfDao';
+import { ChapterDao } from '../data/ChapterDao';
 import { Exporter } from '../export/Exporter';
 import { ExportDialog } from './ExportDialog';
 import { Log } from '../common/Logger';
@@ -144,6 +145,14 @@ struct Bookshelf {
   private pendingMove: Work | null = null;
   /** 正在导出的书（按钮置灰用） */
   @State exportingId: string = '';
+
+  /** 每本书「最新章节梗概」：workId → 「章节名：梗概」，翻译过的书才有 */
+  @State briefs: Record<string, string> = {};
+
+  /** 剧情进展面板 */
+  @State showBrief: boolean = false;
+  @State briefWork: Work | null = null;
+  @State briefChapters: Chapter[] = [];
   private exportDialog: CustomDialogController = new CustomDialogController({
     builder: ExportDialog({
       onlyBook: true,
@@ -206,6 +215,14 @@ struct Bookshelf {
       const list = await WorkDao.list();
       this.works = list;
       this.shelves = await ShelfDao.list();
+      // 每本书的最新章节梗概，整表一次查齐（翻译过的书才有值）
+      const latest = await ChapterDao.latestSummaries();
+      const briefs: Record<string, string> = {};
+      for (const wid of Object.keys(latest)) {
+        const c = latest[wid];
+        briefs[wid] = `${c.title}：${c.summary}`;
+      }
+      this.briefs = briefs;
       this.applyFilter();
       this.rebuildTabs();
       this.errorMsg = '';
@@ -215,6 +232,17 @@ struct Bookshelf {
     } finally {
       this.loading = false;
     }
+  }
+
+  /** 卡片摘要文案，无翻译的书返回空串 */
+  private briefOf(workId: string): string {
+    const s = this.briefs[workId];
+    return s === undefined ? '' : s;
+  }
+
+  /** 摘要长度参与 ForEach key，翻译进度更新时对应卡片才会重建刷新 */
+  private briefLen(workId: string): number {
+    return this.briefOf(workId).length;
   }
 
   /** 重算分组栏：数量变了数组就换新，ForEach 的 key 里带 count，数字一定跟着更新 */
@@ -599,6 +627,21 @@ struct Bookshelf {
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .width('100%')
 
+      // 剧情摘要：翻译流水线生成的「本章梗概」，取最新一章。
+      // 没翻译过的书没有这行；点开可看全部章节的剧情进展。
+      if (this.briefOf(w.id).length > 0) {
+        Text(this.briefOf(w.id))
+          .fontSize(12)
+          .fontColor($r('app.color.text_tertiary'))
+          .lineHeight(17)
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+          .onClick(() => {
+            this.openBrief(w);
+          })
+      }
+
       Row({ space: 8 }) {
         Text(sourceLabel(w.sourceType))
           .fontSize(11)
@@ -811,13 +854,19 @@ struct Bookshelf {
           // key 里带上 shelfId：卡片上的分组标签和「⋯」菜单都读 w.shelfId，
           // 而 workCard 是 @Builder 按值收 w，只靠 id 做 key 时移动分组后不会重建，
           // 标签会一直显示旧分组。带上 shelfId 让这本书在换组时重建一次。
-          }, (w: Work) => `${w.id}|${w.shelfId}`)
+          // briefLen 参与 key：翻译出新章节梗概后，对应卡片才会重建显示新摘要。
+          }, (w: Work) => `${w.id}|${w.shelfId}|${this.briefLen(w.id)}`)
         }
         .width('100%')
         .layoutWeight(1)
         .padding({ left: $r('app.float.page_padding'), right: $r('app.float.page_padding') })
         .scrollBar(BarState.Off)
         .contentEndOffset(24)
+        .bindSheet($$this.showBrief, this.briefSheet(), {
+          height: 560,
+          showClose: true,
+          title: { title: '剧情进展' }
+        })
       }
 
       this.bottomBar()
@@ -825,6 +874,66 @@ struct Bookshelf {
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.page_background'))
+  }
+
+  /** 点卡片摘要：打开剧情进展面板，按章节顺序列出全部梗概 */
+  private async openBrief(w: Work): Promise<void> {
+    this.briefWork = w;
+    this.showBrief = true;
+    try {
+      this.briefChapters = await ChapterDao.summariesOf(w.id);
+    } catch (e) {
+      Log.e(`读取剧情进展失败：${(e as Error).message}`);
+      this.briefChapters = [];
+    }
+  }
+
+  @Builder
+  briefSheet() {
+    Column({ space: 12 }) {
+      Text(this.briefWork !== null ? `《${this.briefWork.title}》` : '')
+        .fontSize(15)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('app.color.text_primary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .width('100%')
+
+      if (this.briefChapters.length === 0) {
+        Text('还没有章节梗概。翻译章节时会自动生成。')
+          .fontSize(13)
+          .fontColor($r('app.color.text_tertiary'))
+          .width('100%')
+          .layoutWeight(1)
+      } else {
+        List({ space: 16 }) {
+          ForEach(this.briefChapters, (c: Chapter) => {
+            ListItem() {
+              Column({ space: 4 }) {
+                Text(`第 ${c.indexNo + 1} 章 · ${c.title}`)
+                  .fontSize(13)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.text_primary'))
+                  .width('100%')
+                Text(c.summary)
+                  .fontSize(12)
+                  .lineHeight(18)
+                  .fontColor($r('app.color.text_secondary'))
+                  .width('100%')
+              }
+              .width('100%')
+              .alignItems(HorizontalAlign.Start)
+            }
+          }, (c: Chapter) => `${c.id}_${c.summary.length}`)
+        }
+        .layoutWeight(1)
+        .scrollBar(BarState.Off)
+        .width('100%')
+      }
+    }
+    .padding(20)
+    .width('100%')
+    .height('100%')
   }
 
   @Builder
