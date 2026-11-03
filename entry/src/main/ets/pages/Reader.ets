@@ -1,4 +1,5 @@
 import { promptAction } from '@kit.ArkUI';
+import { common } from '@kit.AbilityKit';
 import { Chapter, ChapterStatus, ParaStatus, ParaType, Paragraph, Run, Work, parseRuns } from '../model/Models';
 import { WorkDao } from '../data/WorkDao';
 import { ChapterDao } from '../data/ChapterDao';
@@ -9,6 +10,8 @@ import { ProviderConfig, Settings } from '../common/Settings';
 import { UiPrefs } from '../common/UiPrefs';
 import { TranslateHooks, Translator } from '../translator/Translator';
 import { StoryContext } from '../translator/StoryContext';
+import { Exporter } from '../export/Exporter';
+import { ExportDialog } from './ExportDialog';
 import { Log } from '../common/Logger';
 
 /** 路由参数。用接口而不是 Record，避免 ArkTS 的动态键限制 */
@@ -49,6 +52,19 @@ struct Reader {
   @State work: Work | null = null;
   @State chapters: Chapter[] = [];
   @State current: number = 0;
+  /** 导出进行中：目录里的导出按钮置灰，防止重复点击 */
+  @State exporting: boolean = false;
+  private exportDialog: CustomDialogController = new CustomDialogController({
+    builder: ExportDialog({
+      onlyBook: false,
+      onConfirm: (scope: string, content: string, format: string) => {
+        this.doExport(scope, content, format);
+      }
+    }),
+    autoCancel: true,
+    alignment: DialogAlignment.Center,
+    customStyle: true
+  });
   @State paragraphs: Paragraph[] = [];
   @State loading: boolean = true;
   @State errorMsg: string = '';
@@ -357,6 +373,33 @@ struct Reader {
   private cycleMode(): void {
     this.modeChosen = true;
     this.mode = (this.mode + 1) % 3;
+  }
+
+  /** 组装并落盘导出文件。组装是纯数据库读取，很快；落盘弹系统保存对话框 */
+  private async doExport(scope: string, content: string, format: string): Promise<void> {
+    if (this.work === null || this.exporting) {
+      return;
+    }
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    this.exporting = true;
+    this.getUIContext().getPromptAction().showToast({ message: '正在组装导出内容…' });
+    try {
+      const chapterId = this.current >= 0 && this.current < this.chapters.length
+        ? this.chapters[this.current].id : '';
+      const result = await Exporter.build(this.work, scope, chapterId, content, format);
+      const uri = await Exporter.save(ctx, result);
+      if (uri.length === 0) {
+        this.getUIContext().getPromptAction().showToast({ message: '已取消导出' });
+      } else {
+        this.getUIContext().getPromptAction().showToast({ message: `已保存《${this.work.title}》` });
+      }
+    } catch (e) {
+      const why = (e as Error).message;
+      this.getUIContext().getPromptAction().showToast({ message: `导出失败：${why}` });
+      Log.e(`导出失败：${why}`);
+    } finally {
+      this.exporting = false;
+    }
   }
 
   /* ------------------------- 翻译 ------------------------- */
@@ -896,6 +939,20 @@ struct Reader {
             .enabled(!this.seqRunning && !this.translating && this.current < this.chapters.length - 1)
             .onClick(() => {
               this.startSequence(0);
+            })
+        }
+        .width('100%')
+
+        Row({ space: 10 }) {
+          Button('导出…')
+            .fontSize(13)
+            .height(38)
+            .layoutWeight(1)
+            .backgroundColor($r('app.color.page_background'))
+            .fontColor($r('app.color.text_primary'))
+            .enabled(!this.exporting && this.work !== null)
+            .onClick(() => {
+              this.exportDialog.open();
             })
         }
         .width('100%')

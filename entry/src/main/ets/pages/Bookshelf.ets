@@ -3,6 +3,8 @@ import { common } from '@kit.AbilityKit';
 import { Shelf, Work } from '../model/Models';
 import { WorkDao } from '../data/WorkDao';
 import { ShelfDao } from '../data/ShelfDao';
+import { Exporter } from '../export/Exporter';
+import { ExportDialog } from './ExportDialog';
 import { Log } from '../common/Logger';
 
 function pad2(n: number): string {
@@ -140,6 +142,21 @@ struct Bookshelf {
   @State navBarHeight: number = 0;
   /** 从「新建分组并移入」进来的书，建完组顺手搬过去 */
   private pendingMove: Work | null = null;
+  /** 正在导出的书（按钮置灰用） */
+  @State exportingId: string = '';
+  private exportDialog: CustomDialogController = new CustomDialogController({
+    builder: ExportDialog({
+      onlyBook: true,
+      onConfirm: (scope: string, content: string, format: string) => {
+        this.doExport(this.pendingExport, scope, content, format);
+      }
+    }),
+    autoCancel: true,
+    alignment: DialogAlignment.Center,
+    customStyle: true
+  });
+  /** 菜单点「导出全书」时记住是哪本（@Builder 按值传参，不能靠弹窗回传） */
+  private pendingExport: Work | null = null;
 
   private groupDialog: CustomDialogController = new CustomDialogController({
     builder: GroupNameDialog({
@@ -412,12 +429,47 @@ struct Bookshelf {
       }
     });
     items.push({
+      value: this.exportingId === w.id ? '正在导出…' : '导出全书…',
+      action: () => {
+        if (this.exportingId === w.id) {
+          return;
+        }
+        this.pendingExport = w;
+        this.exportDialog.open();
+      }
+    });
+    items.push({
       value: '删除',
       action: () => {
         this.confirmDelete(w);
       }
     });
     return items;
+  }
+
+  /** 书架入口固定导全书；scope 参数由弹窗给（onlyBook 时恒为 BOOK） */
+  private async doExport(w: Work | null, scope: string, content: string, format: string): Promise<void> {
+    if (w === null || this.exportingId.length > 0) {
+      return;
+    }
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    this.exportingId = w.id;
+    this.getUIContext().getPromptAction().showToast({ message: '正在组装导出内容…' });
+    try {
+      const result = await Exporter.build(w, scope, '', content, format);
+      const uri = await Exporter.save(ctx, result);
+      if (uri.length === 0) {
+        this.getUIContext().getPromptAction().showToast({ message: '已取消导出' });
+      } else {
+        this.getUIContext().getPromptAction().showToast({ message: `已保存《${w.title}》` });
+      }
+    } catch (e) {
+      const why = (e as Error).message;
+      this.getUIContext().getPromptAction().showToast({ message: `导出失败：${why}` });
+      Log.e(`导出失败：${why}`);
+    } finally {
+      this.exportingId = '';
+    }
   }
 
   @Builder
