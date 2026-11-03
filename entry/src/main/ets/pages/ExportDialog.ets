@@ -75,6 +75,7 @@ export struct ExportDialog {
           this.chip('纯译文', ExportContent.TRANSLATION, group)
           this.chip('双语对照', ExportContent.BILINGUAL, group)
         } else {
+          this.chip('EPUB', ExportFormat.EPUB, group)
           this.chip('HTML', ExportFormat.HTML, group)
           this.chip('TXT', ExportFormat.TXT, group)
         }

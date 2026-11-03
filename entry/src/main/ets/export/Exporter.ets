@@ -1,15 +1,18 @@
 import { picker } from '@kit.CoreFileKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
-import { Chapter, ParaType, ParaStatus, Paragraph, Run, Work, parseRuns, runsToPlainText } from '../model/Models';
+import { Chapter, ParaStatus, ParaType, Paragraph, Work, parseRuns, runsToPlainText } from '../model/Models';
 import { ChapterDao } from '../data/ChapterDao';
 import { ParagraphDao } from '../data/ParagraphDao';
 import { FicHub } from '../fetch/FicHub';
+import { HtmlFrag } from './HtmlFrag';
+import { ChapterData, Epub } from './Epub';
 
 /** 导出格式 */
 export class ExportFormat {
   static readonly TXT: string = 'txt';
   static readonly HTML: string = 'html';
+  static readonly EPUB: string = 'epub';
 }
 
 /** 导出内容：纯译文 / 双语对照 */
@@ -25,15 +28,17 @@ export class ExportScope {
 }
 
 export interface ExportResult {
-  /** 组装好的完整文件内容 */
+  /** 文本格式（TXT / HTML）的完整内容；二进制格式时为空串 */
   body: string;
+  /** 二进制格式（EPUB）的字节流；文本格式时为 null */
+  bytes: Uint8Array | null;
   /** 建议的文件名（已做过文件名安全化） */
   fileName: string;
   mime: string;
 }
 
 /**
- * 排版导出：把书库里的作品组装成 TXT / HTML。
+ * 排版导出：把书库里的作品组装成 TXT / HTML / EPUB。
  *
  * 数据基础是 M1 定下的 Run[] 段落模型 —— 原文与译文都是片段数组，
  * 斜体/加粗/下划线/删除线的样式位直接映射成 HTML 标签，不需要任何新解析。
@@ -41,6 +46,8 @@ export interface ExportResult {
  *
  * 译文缺失的段落按阅读器「纯译文模式」的同一策略处理：用原文顶上，
  * 保证导出内容没有空洞。
+ *
+ * 三种格式只在「组装」这一步分叉，取数（章节 + 段落）只做一遍。
  */
 export class Exporter {
 
@@ -65,116 +72,73 @@ export class Exporter {
       throw new Error('没有可导出的章节');
     }
 
-    // 逐章取段落并组装正文
-    const parts: string[] = [];
-    let translatedCount = 0;
+    // 取数只做一遍：三种格式共用这份数据
+    const data: ChapterData[] = [];
     for (let i = 0; i < chapters.length; i++) {
-      const paras = await ParagraphDao.listByChapter(chapters[i].id);
-      for (let p = 0; p < paras.length; p++) {
-        if (paras[p].status === ParaStatus.DONE) {
-          translatedCount++;
-        }
-      }
-      parts.push(Exporter.chapterBlock(chapters[i], paras, content, format));
-      // 控制单文件体积提示：整本导出时把翻译完成度带给调用方决策（当前直接导出，不截断）
+      data.push({ chapter: chapters[i], paras: await ParagraphDao.listByChapter(chapters[i].id) });
     }
 
-    const header = format === ExportFormat.HTML
-      ? Exporter.htmlHeader(work, chapters.length, translatedCount)
-      : Exporter.txtHeader(work);
-    const footer = format === ExportFormat.HTML ? '\n</body>\n</html>\n' : '';
-
-    const ext = format === ExportFormat.HTML ? 'html' : 'txt';
-    const mode = content === ExportContent.BILINGUAL ? '双语' : '译文';
+    const bilingual = content === ExportContent.BILINGUAL;
+    const mode = bilingual ? '双语' : '译文';
     const scopeTag = scope === ExportScope.CHAPTER ? '' : `_${chapters.length}章`;
-    const fileName = `${FicHub.fileSafeName(work.title) || 'export'}_${mode}${scopeTag}.${ext}`;
+    const baseName = `${FicHub.fileSafeName(work.title) || 'export'}_${mode}${scopeTag}`;
 
+    if (format === ExportFormat.EPUB) {
+      return {
+        body: '',
+        bytes: Epub.build(work, data, bilingual),
+        fileName: `${baseName}.epub`,
+        mime: 'application/epub+zip'
+      };
+    }
+
+    if (format === ExportFormat.HTML) {
+      const blocks: string[] = [];
+      let translatedCount = 0;
+      for (let i = 0; i < data.length; i++) {
+        for (let p = 0; p < data[i].paras.length; p++) {
+          if (data[i].paras[p].status === ParaStatus.DONE) {
+            translatedCount++;
+          }
+        }
+        blocks.push(HtmlFrag.chapterHtml(data[i].chapter, data[i].paras, bilingual));
+      }
+      return {
+        body: Exporter.htmlHeader(work, data.length, translatedCount) + blocks.join('\n') + '\n</body>\n</html>\n',
+        bytes: null,
+        fileName: `${baseName}.html`,
+        mime: 'text/html'
+      };
+    }
+
+    // TXT
+    const blocks: string[] = [];
+    for (let i = 0; i < data.length; i++) {
+      blocks.push(Exporter.chapterTxt(data[i].chapter, data[i].paras, bilingual));
+    }
     return {
-      body: header + parts.join(Exporter.blockGap(format)) + footer,
-      fileName: fileName,
-      mime: format === ExportFormat.HTML ? 'text/html' : 'text/plain'
+      body: Exporter.txtHeader(work) + blocks.join('\n\n'),
+      bytes: null,
+      fileName: `${baseName}.txt`,
+      mime: 'text/plain'
     };
   }
 
-  /** 章节块：标题 + 段落 + 摘要附注 */
-  private static chapterBlock(ch: Chapter, paras: Paragraph[], content: string, format: string): string {
+  /** 一章的纯文本块：标题 + 段落 + 摘要附注 */
+  private static chapterTxt(ch: Chapter, paras: Paragraph[], bilingual: boolean): string {
     const lines: string[] = [];
-    if (format === ExportFormat.HTML) {
-      lines.push(`<h2>${Exporter.esc(ch.title)}</h2>`);
-      for (let i = 0; i < paras.length; i++) {
-        lines.push(Exporter.paraHtml(paras[i], content));
-      }
-      if (ch.summary.length > 0) {
-        lines.push(`<p class="note">〔本章梗概〕${Exporter.esc(ch.summary)}</p>`);
-      }
-    } else {
-      lines.push(`\n▍${ch.title}\n`);
-      for (let i = 0; i < paras.length; i++) {
-        lines.push(Exporter.paraTxt(paras[i], content));
-      }
-      if (ch.summary.length > 0) {
-        lines.push(`〔本章梗概〕${ch.summary}`);
-      }
+    lines.push(`\n▍${ch.title}\n`);
+    for (let i = 0; i < paras.length; i++) {
+      lines.push(Exporter.paraTxt(paras[i], bilingual));
+    }
+    if (ch.summary.length > 0) {
+      lines.push(`〔本章梗概〕${ch.summary}`);
     }
     return lines.join('\n');
   }
 
-  /** 单段 HTML。双语对照时原文是灰色小字参考，译文是正文 */
-  private static paraHtml(p: Paragraph, content: string): string {
-    if (p.type === ParaType.DIVIDER) {
-      return '<hr/>';
-    }
-    const src = parseRuns(p.runs);
-    const translated = p.status === ParaStatus.DONE && p.translatedRuns.length > 0
-      ? parseRuns(p.translatedRuns)
-      : null;
-
-    if (content === ExportContent.BILINGUAL && translated !== null && p.type !== ParaType.HEADING) {
-      let html = `<p class="src">${Exporter.runsHtml(src)}</p>\n`;
-      html += Exporter.paraCoreHtml(p.type, translated);
-      return html;
-    }
-    if (translated !== null) {
-      return Exporter.paraCoreHtml(p.type, translated);
-    }
-    // 未翻译：原文当正文（和阅读器纯译文模式同策略）
-    return Exporter.paraCoreHtml(p.type, src);
-  }
-
-  private static paraCoreHtml(type: string, runs: Run[]): string {
-    const inner = Exporter.runsHtml(runs);
-    if (type === ParaType.HEADING) {
-      return `<h3>${inner}</h3>`;
-    }
-    if (type === ParaType.QUOTE) {
-      return `<blockquote><p>${inner}</p></blockquote>`;
-    }
-    return `<p>${inner}</p>`;
-  }
-
-  private static runsHtml(runs: Run[]): string {
-    let html = '';
-    for (let i = 0; i < runs.length; i++) {
-      let t = Exporter.esc(runs[i].text);
-      if (runs[i].bold) {
-        t = `<strong>${t}</strong>`;
-      }
-      if (runs[i].italic) {
-        t = `<em>${t}</em>`;
-      }
-      if (runs[i].underline) {
-        t = `<u>${t}</u>`;
-      }
-      if (runs[i].strike) {
-        t = `<s>${t}</s>`;
-      }
-      html += t;
-    }
-    return html;
-  }
-
-  /** 单段 TXT。双语对照：原文行 → 空行 → 译文行 */
-  private static paraTxt(p: Paragraph, content: string): string {
+  /** 单段 TXT。双语对照：原文行 → 换行 → 译文行 */
+  private static paraTxt(p: Paragraph, bilingual: boolean): string {
     if (p.type === ParaType.DIVIDER) {
       return '────────────';
     }
@@ -184,17 +148,13 @@ export class Exporter {
       : null;
 
     const srcText = runsToPlainText(src);
-    if (content === ExportContent.BILINGUAL && translated !== null && p.type !== ParaType.HEADING) {
+    if (bilingual && translated !== null && p.type !== ParaType.HEADING) {
       return `${srcText}\n${runsToPlainText(translated)}`;
     }
     if (translated !== null) {
       return runsToPlainText(translated);
     }
     return srcText;
-  }
-
-  private static blockGap(format: string): string {
-    return format === ExportFormat.HTML ? '\n' : '\n\n';
   }
 
   private static txtHeader(work: Work): string {
@@ -212,7 +172,7 @@ export class Exporter {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>${Exporter.esc(work.title)}</title>
+<title>${HtmlFrag.esc(work.title)}</title>
 <style>
 body { max-width: 44em; margin: 0 auto; padding: 24px 20px 64px;
   font-family: Georgia, 'Songti SC', SimSun, serif; line-height: 1.9; color: #222; }
@@ -228,17 +188,13 @@ hr { border: none; border-top: 1px solid #ddd; margin: 1.8em auto; width: 40%; }
 </style>
 </head>
 <body>
-<h1>${Exporter.esc(work.title)}</h1>
-<p class="meta">${Exporter.esc(work.author.length > 0 ? work.author : '佚名')} · 由同人译站翻译导出 · ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}</p>
+<h1>${HtmlFrag.esc(work.title)}</h1>
+<p class="meta">${HtmlFrag.esc(work.author.length > 0 ? work.author : '佚名')} · 由同人译站翻译导出 · ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}</p>
 `;
   }
 
-  private static esc(s: string): string {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  }
-
   /**
-   * 落盘：DocumentSavePicker 让用户选保存位置（下载/文档等公共目录）。
+   * 落盘：弹系统保存对话框让用户选位置（下载/文档等公共目录）。
    * 写入必须用 picker 返回的 uri 打开 —— 自己拼公共目录路径会被沙箱拒绝。
    * 注意 SDK 里没有独立的 DocumentSavePicker 类，save() 挂在 DocumentViewPicker 上。
    */
@@ -252,7 +208,14 @@ hr { border: none; border-top: 1px solid #ddd; margin: 1.8em auto; width: 40%; }
     }
     const f = fs.openSync(uris[0], fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
     try {
-      fs.writeSync(f.fd, result.body);
+      if (result.bytes !== null) {
+        // 二进制按 ArrayBuffer 写入；这里 slice 出独立缓冲，避免写入超出字节范围
+        const ab: ArrayBuffer = result.bytes.buffer.slice(
+          result.bytes.byteOffset, result.bytes.byteOffset + result.bytes.byteLength) as ArrayBuffer;
+        fs.writeSync(f.fd, ab);
+      } else {
+        fs.writeSync(f.fd, result.body);
+      }
     } finally {
       fs.closeSync(f);
     }
