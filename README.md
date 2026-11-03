@@ -30,6 +30,8 @@
 
 ## 构建运行
 
+**环境要求**：HarmonyOS NEXT 鸿蒙手机（系统版本 6.1.0 / API 23 及以上）；不支持 Android 设备与旧版 HarmonyOS（2.0/3.0 等可装 APK 的版本）。
+
 1. 安装 [DevEco Studio](https://developer.huawei.com/consumer/cn/deveco-studio/)（需支持 API 6.1.0(23)）
 2. 克隆本仓库后用 DevEco Studio 打开
 3. `File > Project Structure > Signing Configs` 勾选 **Automatically generate signature** 自动生成调试签名
