@@ -18,7 +18,7 @@ export struct ExportDialog {
   onlyBook: boolean = false;
   @State scope: string = ExportScope.BOOK;
   @State content: string = ExportContent.TRANSLATION;
-  @State format: string = ExportFormat.HTML;
+  @State format: string = ExportFormat.EPUB;
 
   private confirm(): void {
     const scope = this.onlyBook ? ExportScope.BOOK : this.scope;
