@@ -1,6 +1,6 @@
-import { promptAction, window } from '@kit.ArkUI';
+import { promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
-import { Shelf, Work, Chapter } from '../model/Models';
+import { Shelf, Work } from '../model/Models';
 import { WorkDao } from '../data/WorkDao';
 import { ShelfDao } from '../data/ShelfDao';
 import { ChapterDao } from '../data/ChapterDao';
@@ -139,20 +139,14 @@ struct Bookshelf {
   @State sorting: boolean = false;
   @State loading: boolean = true;
   @State errorMsg: string = '';
-  /** 系统导航条高度，用于底部操作栏避让三键 */
-  @State navBarHeight: number = 0;
   /** 从「新建分组并移入」进来的书，建完组顺手搬过去 */
   private pendingMove: Work | null = null;
   /** 正在导出的书（按钮置灰用） */
   @State exportingId: string = '';
 
-  /** 每本书「最新章节梗概」：workId → 「章节名：梗概」，翻译过的书才有 */
+  /** 每本书「第一章梗概」：workId → 「章节名：梗概」，翻译过的书才有 */
   @State briefs: Record<string, string> = {};
 
-  /** 剧情进展面板 */
-  @State showBrief: boolean = false;
-  @State briefWork: Work | null = null;
-  @State briefChapters: Chapter[] = [];
   private exportDialog: CustomDialogController = new CustomDialogController({
     builder: ExportDialog({
       onlyBook: true,
@@ -180,34 +174,10 @@ struct Bookshelf {
 
   aboutToAppear(): void {
     this.reload();
-    this.measureNavBar();
   }
 
   onPageShow(): void {
     this.reload();
-  }
-
-  /**
-   * 只在「全屏布局」时才需要额外避让。
-   *
-   * 默认情况下页面本来就排在安全区内，底栏天然贴在导航栏之上；
-   * 此时再补一段 padding 反而会多出一条空白。所以先问窗口是不是全屏，
-   * 是的话才去量系统栏高度。
-   */
-  private async measureNavBar(): Promise<void> {
-    try {
-      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      const win = await window.getLastWindow(ctx);
-      if (!win.getWindowProperties().isLayoutFullScreen) {
-        this.navBarHeight = 0;
-        return;
-      }
-      const area = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
-      const h = px2vp(area.bottomRect.height);
-      this.navBarHeight = h > 0 ? h : 0;
-    } catch (e) {
-      Log.w(`读取导航条高度失败：${(e as Error).message}`);
-    }
   }
 
   private async reload(): Promise<void> {
@@ -215,8 +185,8 @@ struct Bookshelf {
       const list = await WorkDao.list();
       this.works = list;
       this.shelves = await ShelfDao.list();
-      // 每本书的最新章节梗概，整表一次查齐（翻译过的书才有值）
-      const latest = await ChapterDao.latestSummaries();
+      // 每本书的第一章梗概，整表一次查齐（翻译过的书才有值）
+      const latest = await ChapterDao.openingSummaries();
       const briefs: Record<string, string> = {};
       for (const wid of Object.keys(latest)) {
         const c = latest[wid];
@@ -240,7 +210,7 @@ struct Bookshelf {
     return s === undefined ? '' : s;
   }
 
-  /** 摘要长度参与 ForEach key，翻译进度更新时对应卡片才会重建刷新 */
+  /** 摘要长度参与 ForEach key：第一章翻译完成、摘要首次出现时卡片才会重建 */
   private briefLen(workId: string): number {
     return this.briefOf(workId).length;
   }
@@ -627,8 +597,9 @@ struct Bookshelf {
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .width('100%')
 
-      // 剧情摘要：翻译流水线生成的「本章梗概」，取最新一章。
-      // 没翻译过的书没有这行；点开可看全部章节的剧情进展。
+      // 剧情摘要：翻译流水线生成的「本章梗概」，取第一章（故事开场介绍，
+      // 稳定不剧透）。没翻译过的书没有这行；摘要属于卡片的一部分，
+      // 点击行为和卡片一致 —— 进阅读器。
       if (this.briefOf(w.id).length > 0) {
         Text(this.briefOf(w.id))
           .fontSize(12)
@@ -638,7 +609,7 @@ struct Bookshelf {
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
           .onClick(() => {
-            this.openBrief(w);
+            this.openReader(w);
           })
       }
 
@@ -722,8 +693,8 @@ struct Bookshelf {
         .layoutWeight(1)
         .height(46)
         .fontSize(15)
-        .backgroundColor($r('app.color.card_background'))
-        .fontColor($r('app.color.brand_primary'))
+        .backgroundColor($r('app.color.brand_primary'))
+        .fontColor(Color.White)
         .borderRadius(23)
         .onClick(() => {
           this.goSearch();
@@ -744,7 +715,7 @@ struct Bookshelf {
       left: $r('app.float.page_padding'),
       right: $r('app.float.page_padding'),
       top: 10,
-      bottom: 10 + this.navBarHeight
+      bottom: 10
     })
     .backgroundColor($r('app.color.card_background'))
     .border({ width: { top: 0.5 }, color: '#14000000' })
@@ -854,7 +825,7 @@ struct Bookshelf {
           // key 里带上 shelfId：卡片上的分组标签和「⋯」菜单都读 w.shelfId，
           // 而 workCard 是 @Builder 按值收 w，只靠 id 做 key 时移动分组后不会重建，
           // 标签会一直显示旧分组。带上 shelfId 让这本书在换组时重建一次。
-          // briefLen 参与 key：翻译出新章节梗概后，对应卡片才会重建显示新摘要。
+          // briefLen 参与 key：第一章梗概生成后，对应卡片才会重建显示摘要。
           }, (w: Work) => `${w.id}|${w.shelfId}|${this.briefLen(w.id)}`)
         }
         .width('100%')
@@ -862,11 +833,6 @@ struct Bookshelf {
         .padding({ left: $r('app.float.page_padding'), right: $r('app.float.page_padding') })
         .scrollBar(BarState.Off)
         .contentEndOffset(24)
-        .bindSheet($$this.showBrief, this.briefSheet(), {
-          height: 560,
-          showClose: true,
-          title: { title: '剧情进展' }
-        })
       }
 
       this.bottomBar()
@@ -874,66 +840,6 @@ struct Bookshelf {
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.page_background'))
-  }
-
-  /** 点卡片摘要：打开剧情进展面板，按章节顺序列出全部梗概 */
-  private async openBrief(w: Work): Promise<void> {
-    this.briefWork = w;
-    this.showBrief = true;
-    try {
-      this.briefChapters = await ChapterDao.summariesOf(w.id);
-    } catch (e) {
-      Log.e(`读取剧情进展失败：${(e as Error).message}`);
-      this.briefChapters = [];
-    }
-  }
-
-  @Builder
-  briefSheet() {
-    Column({ space: 12 }) {
-      Text(this.briefWork !== null ? `《${this.briefWork.title}》` : '')
-        .fontSize(15)
-        .fontWeight(FontWeight.Medium)
-        .fontColor($r('app.color.text_primary'))
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .width('100%')
-
-      if (this.briefChapters.length === 0) {
-        Text('还没有章节梗概。翻译章节时会自动生成。')
-          .fontSize(13)
-          .fontColor($r('app.color.text_tertiary'))
-          .width('100%')
-          .layoutWeight(1)
-      } else {
-        List({ space: 16 }) {
-          ForEach(this.briefChapters, (c: Chapter) => {
-            ListItem() {
-              Column({ space: 4 }) {
-                Text(`第 ${c.indexNo + 1} 章 · ${c.title}`)
-                  .fontSize(13)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor($r('app.color.text_primary'))
-                  .width('100%')
-                Text(c.summary)
-                  .fontSize(12)
-                  .lineHeight(18)
-                  .fontColor($r('app.color.text_secondary'))
-                  .width('100%')
-              }
-              .width('100%')
-              .alignItems(HorizontalAlign.Start)
-            }
-          }, (c: Chapter) => `${c.id}_${c.summary.length}`)
-        }
-        .layoutWeight(1)
-        .scrollBar(BarState.Off)
-        .width('100%')
-      }
-    }
-    .padding(20)
-    .width('100%')
-    .height('100%')
   }
 
   @Builder

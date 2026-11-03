@@ -80,40 +80,24 @@ export class ChapterDao {
   }
 
   /**
-   * 每本书「最新有梗概的章节」，书架卡片一次查询全部拿齐。
+   * 每本书「第一章梗概」，书架卡片一次查询全部拿齐。
    *
-   * 子查询取该书有梗概章节里 index_no 最大的那一行 —— 即「剧情讲到哪了」。
-   * 没翻译过的书不会有行，卡片也就不显示摘要。
+   * 子查询取该书有梗概章节里 index_no 最小的那一行 —— 第一章梗概天然带
+   * 「故事开场/设定介绍」性质，且翻译进度推进后不会变，放书架上稳定、
+   * 不剧透后面的剧情。没翻译过的书不会有行，卡片也就不显示摘要。
    */
-  static async latestSummaries(): Promise<Record<string, Chapter>> {
+  static async openingSummaries(): Promise<Record<string, Chapter>> {
     const store = await Db.get();
     const rs = await store.querySql(
       `SELECT c.* FROM ${TABLE} c
        WHERE c.summary != '' AND c.status = ?
-         AND c.index_no = (SELECT MAX(c2.index_no) FROM ${TABLE} c2
+         AND c.index_no = (SELECT MIN(c2.index_no) FROM ${TABLE} c2
              WHERE c2.work_id = c.work_id AND c2.summary != '' AND c2.status = ?)`,
       [ChapterStatus.TRANSLATED, ChapterStatus.TRANSLATED]);
     const out: Record<string, Chapter> = {};
     while (rs.goToNextRow()) {
       const c = toChapter(rs);
       out[c.workId] = c;
-    }
-    rs.close();
-    return out;
-  }
-
-  /** 一本书的全部章节梗概，按章节顺序（剧情进展面板用） */
-  static async summariesOf(workId: string): Promise<Chapter[]> {
-    const store = await Db.get();
-    const predicates = new relationalStore.RdbPredicates(TABLE);
-    predicates.equalTo('work_id', workId)
-      .equalTo('status', ChapterStatus.TRANSLATED)
-      .notEqualTo('summary', '')
-      .orderByAsc('index_no');
-    const rs = await store.query(predicates);
-    const out: Chapter[] = [];
-    while (rs.goToNextRow()) {
-      out.push(toChapter(rs));
     }
     rs.close();
     return out;

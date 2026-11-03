@@ -1,4 +1,4 @@
-import { promptAction } from '@kit.ArkUI';
+import { promptAction, window } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { Chapter, ChapterStatus, ParaStatus, ParaType, Paragraph, Run, Work, parseRuns } from '../model/Models';
 import { WorkDao } from '../data/WorkDao';
@@ -37,6 +37,75 @@ const MODE_BOTH: number = 2;
 const MODE_NAMES: string[] = ['原文', '译文', '对照'];
 
 /**
+ * 正文列表的数据源（LazyForEach 用）。
+ *
+ * 为什么必须懒加载：List 配普通 ForEach 会在首帧把「所有」段落一次性
+ * 建成组件树 —— 章节小无所谓，TXT 整本被识别成一个章节（几千段）时，
+ * 主线程一口气建几万个节点直接超过 6 秒无响应，触发 appfreeze
+ * （堆栈：ForEachNode::CompareAndUpdateChildren + Array.forEach）。
+ * LazyForEach 只创建屏幕内外的少量项，滚到哪建到哪。
+ *
+ * 更新语义与原 ForEach 的 key 机制完全一致：key 不变的项复用，
+ * key 变了才重建。所以单段变化走 onDataChanged（该段 key 必然变了，
+ * 见 itemKey），mode/fontStep 等影响全表的走 onDataReloaded。
+ */
+class ParaSource implements IDataSource {
+  private list: Paragraph[] = [];
+  private index: Map<string, number> = new Map<string, number>();
+  private listeners: DataChangeListener[] = [];
+
+  /** 整表替换（进新章节）并广播重建 */
+  reload(list: Paragraph[]): void {
+    this.list = list;
+    const idx: Map<string, number> = new Map<string, number>();
+    for (let i = 0; i < list.length; i++) {
+      idx.set(list[i].id, i);
+    }
+    this.index = idx;
+    this.notifyAll();
+  }
+
+  /** 单段原地变化（译文完成/失败/流式 tick），通知对应项重建 */
+  notifyOne(pid: string): void {
+    const i = this.index.get(pid);
+    if (i === undefined) {
+      return;
+    }
+    for (let k = 0; k < this.listeners.length; k++) {
+      this.listeners[k].onDataChanged(i);
+    }
+  }
+
+  /** 影响全部 key 的状态（显示模式、字号）变了，全表重建 */
+  notifyAll(): void {
+    for (let i = 0; i < this.listeners.length; i++) {
+      this.listeners[i].onDataReloaded();
+    }
+  }
+
+  totalCount(): number {
+    return this.list.length;
+  }
+
+  getData(index: number): Paragraph {
+    return this.list[index];
+  }
+
+  registerDataChangeListener(listener: DataChangeListener): void {
+    if (this.listeners.indexOf(listener) < 0) {
+      this.listeners.push(listener);
+    }
+  }
+
+  unregisterDataChangeListener(listener: DataChangeListener): void {
+    const i = this.listeners.indexOf(listener);
+    if (i >= 0) {
+      this.listeners.splice(i, 1);
+    }
+  }
+}
+
+/**
  * 阅读器。
  *
  * 段落不是字符串而是 Run[]，这里把每个 Run 映射成一个 Span：
@@ -70,6 +139,8 @@ struct Reader {
   @State errorMsg: string = '';
   @State showToc: boolean = false;
   @State fontStep: number = DEFAULT_STEP;
+  /** 系统导航条高度：目录 sheet 的底部工具行要避让三键 */
+  @State navBarHeight: number = 0;
 
   /* ---- 翻译相关 ---- */
   @State mode: number = MODE_SOURCE;
@@ -107,6 +178,8 @@ struct Reader {
 
   private listScroller: Scroller = new Scroller();
   private tocScroller: Scroller = new Scroller();
+  /** 正文列表的数据源：LazyForEach 只建可见项，见 ParaSource 注释 */
+  private paraSrc: ParaSource = new ParaSource();
   private workId: string = '';
   private startChapterId: string = '';
   private translator: Translator | null = null;
@@ -114,7 +187,37 @@ struct Reader {
   aboutToAppear(): void {
     this.readParams();
     this.restoreFont();
+    this.measureNavBar();
     this.load();
+  }
+
+  /**
+   * 量系统导航条高度。目录 sheet 是窗口级浮层，会铺到屏幕底（三键区域
+   * 也在内），「字号」那行直接贴着 sheet 底就会和三键重叠，需要把
+   * 高度补进 padding。
+   *
+   * 注意不能用 isLayoutFullScreen 做开关：那个标志只有显式调过
+   * setWindowLayoutFullScreen(true) 才为 true，而 NEXT 默认窗口本来
+   * 就是沉浸式铺满的。这里无条件读避让区——窗口若真的不铺满，系统
+   * 返回的高度自然是 0，不会产生多余空白。三键导航在 TYPE_SYSTEM，
+   * 手势条在 TYPE_NAVIGATION_INDICATOR，取两者的最大值。
+   */
+  private async measureNavBar(): Promise<void> {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const win = await window.getLastWindow(ctx);
+      const system = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+      let h = px2vp(system.bottomRect.height);
+      try {
+        const indicator = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR);
+        h = Math.max(h, px2vp(indicator.bottomRect.height));
+      } catch (e) {
+        // 低版本没有该类型，忽略
+      }
+      this.navBarHeight = h > 0 ? h : 0;
+    } catch (e) {
+      Log.w(`读取导航条高度失败：${(e as Error).message}`);
+    }
   }
 
   aboutToDisappear(): void {
@@ -209,6 +312,7 @@ struct Reader {
     try {
       const ch = this.chapters[index];
       this.paragraphs = await ParagraphDao.listByChapter(ch.id);
+      this.paraSrc.reload(this.paragraphs);
       this.recount();
       if (!this.modeChosen) {
         // 有译文就直接进对照模式，省得用户每次都要手动切
@@ -309,6 +413,7 @@ struct Reader {
     const next = this.fontStep + delta;
     if (next >= 0 && next < FONT_STEPS.length) {
       this.fontStep = next;
+      this.paraSrc.notifyAll();
       UiPrefs.setFontStep(next);
     }
   }
@@ -373,6 +478,8 @@ struct Reader {
   private cycleMode(): void {
     this.modeChosen = true;
     this.mode = (this.mode + 1) % 3;
+    // mode 参与每段的 key，LazyForEach 需要显式全表重建
+    this.paraSrc.notifyAll();
   }
 
   /** 组装并落盘导出文件。组装是纯数据库读取，很快；落盘弹系统保存对话框 */
@@ -523,7 +630,8 @@ struct Reader {
     this.translator = null;
     this.partialId = '';
     this.partialText = '';
-    this.paragraphs = this.paragraphs.slice();
+    // 段落数组是原地改的，通知全表重建（目录的"已译"靠下面 chapters 重建刷新）
+    this.paraSrc.notifyAll();
     this.recount();
 
     if (this.doneCount >= this.allCount && this.allCount > 0) {
@@ -668,10 +776,17 @@ struct Reader {
     if (pid === this.partialId && now - this.lastPartialAt < 120) {
       return;
     }
+    const prev = this.partialId;
     this.lastPartialAt = now;
     this.partialId = pid;
     this.partialText = text;
     this.partialTick = this.partialTick >= 9999 ? 0 : this.partialTick + 1;
+    // LazyForEach 下 key 变化不会自动重渲染，要显式通知。
+    // 上一段的流式态要撤（它的 key 里 tick 归零），新段要亮起。
+    if (prev.length > 0 && prev !== pid) {
+      this.paraSrc.notifyOne(prev);
+    }
+    this.paraSrc.notifyOne(pid);
   }
 
   private applyDone(pid: string, runsJson: string): void {
@@ -683,15 +798,17 @@ struct Reader {
         break;
       }
     }
-    this.paragraphs = list.slice();
     if (this.partialId === pid) {
       this.partialId = '';
       this.partialText = '';
     }
+    // 先撤流式态再通知该段重建：key 里的 status/tick 都变了
+    this.paraSrc.notifyOne(pid);
     this.transDone++;
     this.doneCount++;
     if (!this.modeChosen && this.mode === MODE_SOURCE) {
       this.mode = MODE_BOTH;
+      this.paraSrc.notifyAll();
     }
   }
 
@@ -703,7 +820,7 @@ struct Reader {
         break;
       }
     }
-    this.paragraphs = list.slice();
+    this.paraSrc.notifyOne(pid);
     this.transDone++;
     Log.w(`段落 ${pid} 翻译失败：${reason}`);
   }
@@ -715,7 +832,7 @@ struct Reader {
         list[i].translatedRuns = '';
         list[i].status = ParaStatus.PENDING;
       }
-      this.paragraphs = list.slice();
+      this.paraSrc.notifyAll();
       this.doneCount = 0;
       const ids: string[] = [];
       for (let i = 0; i < list.length; i++) {
@@ -990,7 +1107,7 @@ struct Reader {
         Blank()
       }
       .width('100%')
-      .padding({ left: 20, right: 20, top: 10, bottom: 16 })
+      .padding({ left: 20, right: 20, top: 10, bottom: 16 + this.navBarHeight })
     }
     .width('100%')
     .height('100%')
@@ -1095,7 +1212,8 @@ struct Reader {
         .justifyContent(FlexAlign.Center)
       } else {
         List({ scroller: this.listScroller, space: 14 }) {
-          ForEach(this.paragraphs, (p: Paragraph, i: number) => {
+          // 懒加载：几千段的整本式章节也只创建可见项，进页不再卡死主线程
+          LazyForEach(this.paraSrc, (p: Paragraph, i: number) => {
             ListItem() {
               this.paragraphView(p)
             }
