@@ -3,6 +3,10 @@ import { ToolDef } from '../provider/LlmProvider';
 import { FicHub, FicMeta, ProbeResult } from './FicHub';
 import { HttpFetch } from './HttpFetch';
 import { WebChapter, WebPageFetched, WebToBook } from './WebToBook';
+import { SiteRules, SiteRule } from './SiteRules';
+import { FileTextReader } from '../parser/FileTextReader';
+import { HtmlParser } from '../parser/HtmlParser';
+import { XhtmlConverter } from '../parser/XhtmlConverter';
 import { PendingItem, PendingStore } from './PendingStore';
 import { Tavily, TavilyHit } from './Tavily';
 import { WebPage, PageResult } from './WebPage';
@@ -73,6 +77,41 @@ interface PageReply {
   text: string;
   truncated: boolean;
   note: string;
+  steps_left: number;
+  hint: string;
+}
+
+/** debug_fetch 的体检报告 */
+interface DebugReply {
+  status: string;
+  http_status: number;
+  content_type: string;
+  bytes: number;
+  title: string;
+  visible_text_chars: number;
+  direct_extract: string;
+  markers: string[];
+  data_outline: string[];
+  rule_hit: string;
+  preview: string;
+  note: string;
+  steps_left: number;
+  hint: string;
+}
+
+/** manage_site_rules 的回包 */
+interface RulesReply {
+  status: string;
+  note: string;
+  rules: SiteRule[];
+  steps_left: number;
+  hint: string;
+}
+
+/** read_recent_logs 的回包 */
+interface LogsReply {
+  status: string;
+  logs: string;
   steps_left: number;
   hint: string;
 }
@@ -156,12 +195,39 @@ export class FinderTools {
       type: 'function',
       function: {
         name: 'html_to_book',
-        description: '把网页抓成本地书放进待入库区（FicHub 不支持的站点的兜底路，如 LOFTER、晋江免费章节、博客、论坛帖子串）。urls 按阅读顺序传数组，每个网页合成一章；只抓一个网页时也可以只传一个元素的数组。JS 动态渲染的页面会自动用内置浏览器渲染后抽取（每页要多等十几秒）；需要登录才能看、内容主要是图片或反爬极强的页面才会抓不到正文而失败',
+        description: '把网页抓成本地书放进待入库区（FicHub 不支持的站点的兜底路，如 LOFTER、晋江免费章节、博客、论坛帖子串）。urls 按阅读顺序传数组，每个网页合成一章；只抓一个网页时也可以只传一个元素的数组。命中站点规则的站会按规则直接抽取（快）；否则静态页直抓、JS 动态渲染的页面自动用内置浏览器渲染后抽取（每页要多等十几秒）；需要登录才能看、内容主要是图片或反爬极强的页面才会抓不到正文而失败',
         parameters: JSON.parse(
           '{"type":"object","properties":{"urls":{"type":"array","items":{"type":"string"},"description":"按阅读顺序排列的网页地址，1~30 个"},"title":{"type":"string","description":"书名，不填就用第一个网页的标题"},"author":{"type":"string","description":"作者"}},"required":["urls"]}')
       }
     };
-    return [webSearch, fetchPage, probe, webBook, download];
+    const debugFetch: ToolDef = {
+      type: 'function',
+      function: {
+        name: 'debug_fetch',
+        description: '抓网页的「体检报告」：HTTP 状态、字节数、页面标题、可见文本量、直抓能抽出多少段正文、源码里检测到的内嵌数据标记（__NEXT_DATA__/__initialize_data__ 等，这类页面正文其实藏在源码 JSON 里）、内嵌 JSON 的结构速览（用来推断站点规则的取值路径）、站点规则命中情况和正文前 300 字预览。只直抓不渲染。html_to_book 抓不到、或你判断不了某个站是什么形态时，先调它再做决定，别瞎猜',
+        parameters: JSON.parse(
+          '{"type":"object","properties":{"url":{"type":"string","description":"要体检的网页地址"}},"required":["url"]}')
+      }
+    };
+    const manageRules: ToolDef = {
+      type: 'function',
+      function: {
+        name: 'manage_site_rules',
+        description: '查看或维护「站点抓取规则」。规则告诉 html_to_book 怎么从某个站抽正文，两种写法：①内嵌数据规则：marker（源码里的 JSON 定位标记，如 __initialize_data__）+ json_content（正文在 JSON 里的点分路径，如 postData.data.postView.content），可选 json_title；②元素规则：selector 定位正文容器（如 div.post-content、article）。action=list 列出现有规则；action=add 添加或按 url_pattern 覆盖（先用 debug_fetch 的 data_outline 推断路径，写完直接重试 html_to_book 验证）；action=remove 删除自定义规则（内置规则不可删）。规则存本地，立即生效，不用重新装应用',
+        parameters: JSON.parse(
+          '{"type":"object","properties":{"action":{"type":"string","enum":["list","add","remove"],"description":"list=列出全部规则，add=添加/覆盖，remove=删除"},"url_pattern":{"type":"string","description":"URL 匹配子串，如 lofter.com/post；命中即用这条规则"},"marker":{"type":"string","description":"内嵌 JSON 定位标记"},"json_title":{"type":"string","description":"标题的点分路径，可空（配合 title_from_first_paragraph）"},"json_content":{"type":"string","description":"正文 HTML 的点分路径"},"selector":{"type":"string","description":"正文容器选择器（tag.class / .class / #id / tag）"},"title_from_first_paragraph":{"type":"boolean","description":"无标题时用首段前 40 字当书名，默认 true"},"note":{"type":"string","description":"规则备注，如站点名"}},"required":["action"]}')
+      }
+    };
+    const readLogs: ToolDef = {
+      type: 'function',
+      function: {
+        name: 'read_recent_logs',
+        description: '读取应用最近的运行日志（最近几分钟，含抓取、渲染、模型请求的详细过程）。某个工具刚才失败了但回包没说清原因时调它：日志里能看到内置渲染抽到的 HTML 大小和正文字符数、HTTP 错误码等现场信息',
+        parameters: JSON.parse(
+          '{"type":"object","properties":{"lines":{"type":"integer","description":"要看最近多少条，默认 80"}}}')
+      }
+    };
+    return [webSearch, fetchPage, probe, webBook, download, debugFetch, manageRules, readLogs];
   }
 
   /** 执行一次工具调用，返回喂回模型的 JSON */
@@ -180,6 +246,15 @@ export class FinderTools {
     }
     if (name === 'download_file') {
       return FinderTools.downloadFile(args, ctx, st);
+    }
+    if (name === 'debug_fetch') {
+      return FinderTools.debugFetch(args, ctx, st);
+    }
+    if (name === 'manage_site_rules') {
+      return FinderTools.manageSiteRules(args, ctx, st);
+    }
+    if (name === 'read_recent_logs') {
+      return FinderTools.readRecentLogs(args, ctx, st);
     }
     return FinderTools.reply('bad_tool', `没有名为 ${name} 的工具`, null, '', st);
   }
@@ -466,6 +541,170 @@ export class FinderTools {
       const why = (e as Error).message;
       return FinderTools.reply('fail', `网页已抓取但入库失败：${why}`, null, path, st);
     }
+  }
+
+  /**
+   * debug_fetch：网页体检报告。
+   *
+   * 只直抓不渲染（渲染的观测交给 fetch_page / 日志）。目标是用一次调用
+   * 回答「这个站属于哪种形态」：静态页直抓就能出段数；壳 + 内嵌数据会
+   * 报出标记和 JSON 结构速览，模型据此写站点规则；真 CSR 两项都为空，
+   * 只能走渲染或建议用户分享。
+   */
+  private static async debugFetch(args: Record<string, Object>, ctx: FinderCtx, st: FinderState): Promise<string> {
+    const url = FinderTools.str(args, 'url');
+    if (url.length === 0) {
+      return FinderTools.reply('bad_args', '缺少 url 参数', null, '', st);
+    }
+    ctx.hooks.onAction(`🩺 体检：${url}`);
+    const b = FinderTools.budget(st);
+    const dir = `${ctx.ui.cacheDir}/finder_dl`;
+    const res = await HttpFetch.toFile(url, dir);
+    if (!res.ok) {
+      const reply: DebugReply = {
+        status: 'fail', http_status: 0, content_type: '', bytes: 0, title: '',
+        visible_text_chars: 0, direct_extract: '', markers: [], data_outline: [],
+        rule_hit: '', preview: '', note: res.note,
+        steps_left: b.steps_left, hint: b.hint
+      };
+      ctx.hooks.onAction(`　　体检失败：${res.note}`);
+      return JSON.stringify(reply);
+    }
+    let text = '';
+    try {
+      text = FileTextReader.read(res.path);
+    } catch (e) {
+      text = '';
+    } finally {
+      try {
+        fs.unlinkSync(res.path);
+      } catch (e) {
+        // 忽略
+      }
+    }
+    const root = HtmlParser.parse(text);
+    let title = '';
+    const titleNode = HtmlParser.findFirst(root, 'title');
+    if (titleNode !== null) {
+      title = XhtmlConverter.normalizeSpace(HtmlParser.textOf(titleNode));
+    }
+    const visible = WebPage.toText(text);
+    let paraCount = 0;
+    let paraChars = 0;
+    try {
+      const ps = XhtmlConverter.toParagraphs(root);
+      for (let i = 0; i < ps.length; i++) {
+        let len = 0;
+        for (let j = 0; j < ps[i].runs.length; j++) {
+          len += ps[i].runs[j].text.length;
+        }
+        paraChars += len;
+        if (ps[i].type !== 'divider' && len > 0) {
+          paraCount++;
+        }
+      }
+    } catch (e) {
+      paraCount = -1;
+    }
+    const markers = SiteRules.markersIn(text);
+    const outline: string[] = [];
+    for (let i = 0; i < markers.length; i++) {
+      const json = SiteRules.extractJsonAfter(text, markers[i]);
+      if (json === null) {
+        continue;
+      }
+      try {
+        const data = JSON.parse(json) as Object;
+        SiteRules.outline(data, outline, 40);
+      } catch (e) {
+        outline.push(`${markers[i]}：JSON 解析失败`);
+      }
+      break;
+    }
+    const hit = SiteRules.extract(text, url);
+    const reply: DebugReply = {
+      status: 'ok',
+      http_status: 200,
+      content_type: res.contentType,
+      bytes: res.bytes,
+      title: title,
+      visible_text_chars: visible.length,
+      direct_extract: paraCount === -1 ? '直抓解析异常' : `直抓可抽出 ${paraCount} 段约 ${paraChars} 字`,
+      markers: markers,
+      data_outline: outline,
+      rule_hit: hit === null ? '' : `命中规则「${hit.rule.note}」：标题「${hit.title}」，${hit.paragraphs.length} 段`,
+      preview: visible.length > 0 ? visible.substring(0, 300) : '',
+      note: markers.length > 0 && hit === null
+        ? '页面内嵌了数据但规则未命中：正文多半就在源码 JSON 里，可用 manage_site_rules(add) 按 data_outline 里的路径写规则'
+        : (visible.length < 300 && markers.length === 0 ? '可见文本极少：可能是 JS 动态渲染（数据在接口里），只能内置渲染抓，或需要登录' : ''),
+      steps_left: b.steps_left,
+      hint: b.hint
+    };
+    ctx.hooks.onAction(`　　体检完成：${res.bytes} 字节，${title.length > 0 ? title : '（无标题）'}，${reply.direct_extract}${markers.length > 0 ? `，内嵌标记 ${markers.join('/')}` : ''}`);
+    return JSON.stringify(reply);
+  }
+
+  /** manage_site_rules：站点规则的增删查，模型自己适配新站的入口 */
+  private static manageSiteRules(args: Record<string, Object>, ctx: FinderCtx, st: FinderState): string {
+    const action = FinderTools.str(args, 'action');
+    const b = FinderTools.budget(st);
+    const send = (status: string, note: string, rules: SiteRule[]): string => {
+      const reply: RulesReply = {
+        status: status, note: note, rules: rules,
+        steps_left: b.steps_left, hint: b.hint
+      };
+      return JSON.stringify(reply);
+    };
+    if (action === 'list') {
+      const rules = SiteRules.allRules();
+      ctx.hooks.onAction(`📋 站点规则：共 ${rules.length} 条`);
+      return send('ok', rules.length === 0 ? '还没有任何规则' : '', rules);
+    }
+    if (action === 'add') {
+      const pattern = FinderTools.str(args, 'url_pattern');
+      const marker = FinderTools.str(args, 'marker');
+      const jsonTitle = FinderTools.str(args, 'json_title');
+      const jsonContent = FinderTools.str(args, 'json_content');
+      const selector = FinderTools.str(args, 'selector');
+      const note = FinderTools.str(args, 'note');
+      const fromFirst = FinderTools.bool(args, 'title_from_first_paragraph', true);
+      const why = SiteRules.addRule(pattern, marker, jsonTitle, jsonContent, selector, fromFirst, note);
+      ctx.hooks.onAction(`📐 站点规则：${why}`);
+      return send(why.indexOf('已') === 0 ? 'ok' : 'bad_args', why, SiteRules.allRules());
+    }
+    if (action === 'remove') {
+      const pattern = FinderTools.str(args, 'url_pattern');
+      const why = SiteRules.removeRule(pattern);
+      ctx.hooks.onAction(`📐 站点规则：${why}`);
+      return send(why.indexOf('已') === 0 ? 'ok' : 'bad_args', why, SiteRules.allRules());
+    }
+    return send('bad_args', `不认识的 action：${action}（可用 list / add / remove）`, SiteRules.allRules());
+  }
+
+  /** read_recent_logs：把应用内日志环形缓冲回喂给模型，失败现场自己看 */
+  private static readRecentLogs(args: Record<string, Object>, ctx: FinderCtx, st: FinderState): string {
+    const lines = FinderTools.int(args, 'lines', 80);
+    const logs = Log.recent(lines);
+    const b = FinderTools.budget(st);
+    ctx.hooks.onAction('📜 已读取应用日志');
+    const payload: LogsReply = {
+      status: 'ok',
+      logs: logs.length > 0 ? logs : '（还没有日志）',
+      steps_left: b.steps_left,
+      hint: b.hint
+    };
+    return JSON.stringify(payload);
+  }
+
+  private static bool(args: Record<string, Object>, key: string, def: boolean): boolean {
+    const v = args[key];
+    if (typeof v === 'boolean') {
+      return v;
+    }
+    if (typeof v === 'string') {
+      return v === 'true' || v === '1';
+    }
+    return def;
   }
 
   private static reply(status: string, note: string, meta: FicMeta | null, path: string, st: FinderState): string {

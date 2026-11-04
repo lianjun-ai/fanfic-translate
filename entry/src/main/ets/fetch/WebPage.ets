@@ -110,8 +110,8 @@ export class WebPage {
     return WebPage.decode(m[1]).replace(/\s+/g, ' ').trim();
   }
 
-  /** HTML → 纯文本 */
-  private static toText(html: string): string {
+  /** HTML → 纯文本（debug_fetch 的体检报告也用它量可见文本量） */
+  static toText(html: string): string {
     let s = html;
     s = s.replace(/<script[\s\S]*?<\/script>/gi, ' ');
     s = s.replace(/<style[\s\S]*?<\/style>/gi, ' ');

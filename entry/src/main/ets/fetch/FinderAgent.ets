@@ -2,6 +2,7 @@ import { common } from '@kit.AbilityKit';
 import { ProviderConfig } from '../common/Settings';
 import { AssistantTurn, ChatMessage, LlmProvider, ToolCallShape } from '../provider/LlmProvider';
 import { FicHubError } from './FicHub';
+import { SiteRules } from './SiteRules';
 import { FinderCtx, AgentHooks, FinderResult, MAX_ROUNDS, RunControl } from './FinderTypes';
 import { FinderState, FinderTools } from './FinderTools';
 import { Log } from '../common/Logger';
@@ -28,8 +29,11 @@ const FINDER_SYSTEM: string = `你是这个阅读应用里的找文助手。用�
 - web_search(query, max_results?) — 联网搜索，返回标题、链接、摘要。成本很低，适合还不知道具体是哪篇时找线索。
 - fetch_page(url, max_chars?) — 打开网页读正文（脚本样式会被去掉，长页面会截断）。想确认某个链接是不是那篇文、看章节数、读推荐榜单时用它。它只读网页，不会把网页变成书。页面是 JS 动态渲染（如 LOFTER 标签页、晋江搜索结果页）时它会自动改用内置浏览器渲染，能读到但每页要多等十几秒，别在一步里并发太多渲染请求。
 - fichub_get(url) — 把作品页变成 EPUB 放进待入库区，一步到位。它会先花十几秒探 FicHub 有没有缓存，命中就直接取；没命中会继续等它现场抓源站转换，可能一两分钟。站点不支持或被限流时会失败并说明原因。
-- html_to_book(urls, title?, author?) — 把网页抓成本地书放进待入库区，urls 按阅读顺序传数组（每个网页合成一章，单页也行）。这是 FicHub 不支持的站点的兜底路：LOFTER、晋江免费章节、博客、论坛帖子串都能收。静态页直抓，JS 动态渲染的页面会自动用内置浏览器渲染后重试（每页多十几秒）。
+- html_to_book(urls, title?, author?) — 把网页抓成本地书放进待入库区，urls 按阅读顺序传数组（每个网页合成一章，单页也行）。这是 FicHub 不支持的站点的兜底路：LOFTER、晋江免费章节、博客、论坛帖子串都能收。命中站点规则的站按规则直接抽取（快）；否则静态页直抓，JS 动态渲染的页面会自动用内置浏览器渲染后重试（每页多十几秒）。
 - download_file(url, title?, author?) — 直接下载任意 URL 上的文件，EPUB/TXT 会自动放进待入库区。手上已经有文件直链时用它。
+- debug_fetch(url) — 网页体检报告：HTTP 状态、字节数、标题、可见文本量、直抓能抽出多少段、源码里的内嵌数据标记（正文藏在源码 JSON 里的信号）和 JSON 结构速览、站点规则命中情况、正文预览。只直抓不渲染。判断不了某个站是什么形态、或 html_to_book 失败想弄清原因时，先调它。
+- manage_site_rules(action, ...) — 站点抓取规则的增删查。规则告诉 html_to_book 某个站怎么抽正文（内嵌 JSON 路径或正文元素选择器），存在本地立即生效。list 列出规则；add 添加/覆盖（url_pattern + marker+json_content 或 selector）；remove 删除自定义规则。
+- read_recent_logs(lines?) — 读应用最近的运行日志。工具失败但回包没说清原因时调它，日志里有渲染抽取的字节数、正文字符数、HTTP 错误等现场。
 
 一次可以发多个工具调用。互不依赖的操作要一次发出来：比如同时探测 3 个链接、同时读 2 个页面。同一轮里的多个调用只消耗一步，一个一个发是最费步数的做法。
 
@@ -41,7 +45,10 @@ const FINDER_SYSTEM: string = `你是这个阅读应用里的找文助手。用�
 怎么组合由你判断。下面是一些经验，不是规定：
 - 已经确定要这本且站点在 FicHub 支持范围内（AO3、FanFiction.net、SpaceBattles、SufficientVelocity、FictionPress 等），直接 fichub_get，不要再单独探一次 —— 它自己会先探缓存再决定等多久，多调一步只是白等十几秒。
 - 中文站点（LOFTER、晋江、博客、论坛等）FicHub 不支持：先 fetch_page 或 web_search 确认链接，然后用 html_to_book。一篇文拆成多帖/多章连载时，把按阅读顺序的链接凑齐，一次传给 urls 合成一本；搜到的每章链接也可以先批量 fetch_page 确认顺序。
-- html_to_book 仍抓不到正文（页面要登录、内容主要是图片、或反爬极强，典型如微博、小红书、番茄）时不要反复重试 —— 同样的 URL 结果不会变。直接建议用户换路：在浏览器里打开文章、等正文显示后把链接分享给本应用，或复制正文存成 TXT 从「导入本地文件」进来。
+- html_to_book 仍抓不到正文时按这个顺序排障，不要盲目重试：
+  1) debug_fetch 看体检报告。「内嵌数据标记」非空且规则未命中 = 正文其实就在源码 JSON 里：从 data_outline 的路径提示推断标题和正文的点分路径，用 manage_site_rules(add) 写规则（marker 填标记名，json_content 填正文路径；猜不准就在 outline 的字符串字段里找长度最大的那段），然后重试 html_to_book 验证。规则写对一次，这个站以后永远直抓。
+  2) 报告显示可见文本极少、也没有内嵌标记 = 真 JS 渲染或需要登录。看 read_recent_logs 里渲染抽取的正文字符数：渲染抽到了字数就用结果，还是 0 就是登录墙/风控。
+  3) 两轮排障还搞不定就收手，建议用户换路：在浏览器里打开文章、等正文显示后把链接分享给本应用，或复制正文存成 TXT 从「导入本地文件」进来。同样的 URL 反复抓结果不会变，别浪费步数。
 - FicHub 限流时别死磕：换 html_to_book 或搜 EPUB/TXT 直链走 download_file。
 - 搜索结果只有几行摘要，别只凭标题猜内容；要确认就 fetch_page 打开看。
 - 同一个 URL 不要反复调同一个工具，结果不会变。
@@ -79,6 +86,8 @@ export class FinderAgent {
     });
     const tools = FinderTools.defs();
     const ctx: FinderCtx = { cfg: cfg, ui: ui, hooks: hooks };
+    // 站点规则引擎的存储目录（用户自定义抓取规则的持久化位置）
+    SiteRules.init(ui.filesDir);
     const st: FinderState = FinderTools.newState();
 
     let finalText = '';
