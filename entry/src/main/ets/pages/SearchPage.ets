@@ -1,9 +1,11 @@
 import { common } from '@kit.AbilityKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
+import { webview } from '@kit.ArkWeb';
 import { DuplicateError, Importer } from '../parser/Importer';
 import { FicHub, FicMeta } from '../fetch/FicHub';
 import { AgentHooks, FinderResult, RunControl } from '../fetch/FinderTypes';
 import { FinderAgent } from '../fetch/FinderAgent';
+import { HeadlessRenderer } from '../fetch/HeadlessRenderer';
 import { PendingItem, PendingStore } from '../fetch/PendingStore';
 import { ChatMessage } from '../provider/LlmProvider';
 import { ProviderConfig, Settings } from '../common/Settings';
@@ -62,12 +64,22 @@ struct SearchPage {
   @State expandedIds: string[] = [];
   @State showPending: boolean = false;
   /** 正在流式输出的文本（模型一边生成一边覆盖这里） */
+  /** 正在流式输出的文本（模型一边生成一边覆盖这里） */
   @State streamText: string = '';
   @State streaming: boolean = false;
+
+  /** 内置渲染器的隐藏 Web 组件：首次渲染请求才挂载（惰性），省启动内存 */
+  @State showRendererWeb: boolean = false;
+  private renderCtrl: webview.WebviewController = new webview.WebviewController();
 
   aboutToAppear(): void {
     this.readRouteParams();
     this.loadPending();
+    HeadlessRenderer.setHost({
+      requestMount: (): void => {
+        this.showRendererWeb = true;
+      }
+    });
   }
 
   /** 系统分享进来时预填链接，用户确认后自己发出去 */
@@ -860,6 +872,20 @@ struct SearchPage {
       }
 
       this.inputBar()
+
+      // 内置渲染器宿主：1×1 隐藏组件，只有 JS 渲染降级时才真正加载页面。
+      // 挂载由 HeadlessRenderer 首次请求触发（showRendererWeb），平时不存在。
+      if (this.showRendererWeb) {
+        Web({ src: 'about:blank', controller: this.renderCtrl })
+          .width(1)
+          .height(1)
+          .onControllerAttached(() => {
+            HeadlessRenderer.attachController(this.renderCtrl);
+          })
+          .onPageEnd((event: OnPageEndEvent) => {
+            HeadlessRenderer.notifyPageEnd(event.url);
+          })
+      }
     }
     .width('100%')
     .height('100%')

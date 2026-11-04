@@ -1,4 +1,5 @@
 import { http } from '@kit.NetworkKit';
+import { HeadlessRenderer } from './HeadlessRenderer';
 import { Log } from '../common/Logger';
 
 /**
@@ -25,6 +26,8 @@ export interface PageResult {
 
 /** 单页最多收这么多字节，防止撞上巨型页面把内存撑爆 */
 const MAX_BYTES: number = 1200000;
+/** 可读文本少于此值视为 JS 渲染空壳，降级用内置渲染器重抽 */
+const SHELL_TEXT_CHARS: number = 300;
 
 export class WebPage {
   static async read(url: string, maxChars: number): Promise<PageResult> {
@@ -53,14 +56,31 @@ export class WebPage {
       if (html.length > MAX_BYTES) {
         html = html.substring(0, MAX_BYTES);
       }
-      const title = WebPage.titleOf(html);
+      let title = WebPage.titleOf(html);
       let text = WebPage.toText(html);
+      let note = '';
+      if (text.length < SHELL_TEXT_CHARS) {
+        // 空壳页（SPA）：正文要靠 JS 调接口插入，直接抓只有骨架。
+        // 用隐藏 ArkWeb 真渲染一次再抽 —— 站内搜索结果页（晋江/LOFTER 标签页）都靠这条路。
+        const rendered = await HeadlessRenderer.render(url);
+        if (rendered.ok) {
+          const renderedTitle = WebPage.titleOf(rendered.html);
+          if (renderedTitle.length > 0) {
+            title = renderedTitle;
+          }
+          text = WebPage.toText(rendered.html);
+          note = '已用内置浏览器渲染（页面为 JS 动态渲染）';
+          Log.i(`fetch_page 渲染降级成功：${url}`);
+        } else {
+          Log.w(`fetch_page 渲染降级失败：${rendered.note}`);
+        }
+      }
       let truncated = false;
       if (text.length > maxChars) {
         text = text.substring(0, maxChars);
         truncated = true;
       }
-      return { ok: true, status: 200, title: title, text: text, truncated: truncated, note: '' };
+      return { ok: true, status: 200, title: title, text: text, truncated: truncated, note: note };
     } catch (e) {
       const raw = (e as Error).message;
       Log.i(`网页读取失败（${raw}）：${url}`);

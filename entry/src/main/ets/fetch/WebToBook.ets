@@ -1,10 +1,12 @@
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { HttpFetch } from './HttpFetch';
+import { HeadlessRenderer } from './HeadlessRenderer';
 import { FileTextReader } from '../parser/FileTextReader';
 import { HtmlNode, HtmlParser } from '../parser/HtmlParser';
 import { XhtmlConverter } from '../parser/XhtmlConverter';
 import { ParsedChapter, ParsedParagraph } from '../parser/ParserTypes';
 import { ParaType, Run } from '../model/Models';
+import { Log } from '../common/Logger';
 
 /** 单页正文字符上限：超过截断并提示，防止一个无限长页面撑爆一本书 */
 const MAX_PAGE_CHARS: number = 200000;
@@ -31,11 +33,12 @@ export interface WebChapter {
  * 走完整条正文抽取管线（和本地导入 HTML 同一套解析器），再序列化回带
  * <h1> 分章标记的合并文档，由 HtmlFileParser 在导入时拆成多章。
  *
- * 能力边界：只对「网页源码里就有正文」的静态页面有效。需要登录、
- * JS 动态渲染（微博、小红书）或强反爬（番茄字体混淆）的页面抓不到正文。
+ * 两级取正文：先直抓源码（便宜，覆盖静态页）；抽不到正文说明页面是
+ * JS 动态渲染，自动降级到隐藏 ArkWeb 真渲染一次再抽（见 HeadlessRenderer）。
+ * 仍拿不到（需要登录 / 强反爬）才报失败，由调用方建议用户走分享入口。
  */
 export class WebToBook {
-  /** 抓单个网页并抽取正文段落 */
+  /** 抓单个网页并抽取正文段落（直抓失败于空壳时自动用内置渲染重试） */
   static async fetchPage(url: string, tmpDir: string): Promise<WebPageFetched> {
     const res = await HttpFetch.toFile(url, tmpDir);
     if (!res.ok) {
@@ -56,6 +59,35 @@ export class WebToBook {
     if (text.indexOf('<') < 0) {
       return { ok: false, note: '返回内容不是网页（可能被反爬拦截）', title: '', paragraphs: [], chars: 0 };
     }
+    const direct = WebToBook.processHtml(text, '');
+    if (direct.ok) {
+      return direct;
+    }
+    // 直抓空壳：多半是 JS 动态渲染，用隐藏 ArkWeb 真渲染一次
+    const rendered = await WebToBook.renderFallback(url);
+    if (rendered !== null) {
+      return rendered;
+    }
+    return direct;
+  }
+
+  /** 用隐藏 ArkWeb 渲染后重新抽取；仍抽不到正文返回 null（沿用直抓的失败说明） */
+  private static async renderFallback(url: string): Promise<WebPageFetched | null> {
+    const res = await HeadlessRenderer.render(url);
+    if (!res.ok) {
+      Log.w(`内置渲染降级失败：${res.note}`);
+      return null;
+    }
+    const out = WebToBook.processHtml(res.html, '已用内置浏览器渲染；');
+    if (!out.ok) {
+      Log.w('内置渲染完成但未抽出正文');
+      return null;
+    }
+    return out;
+  }
+
+  /** 解析 HTML 文本 → 标题 + 截断后的正文段落。prefix 拼在成功时的 note 前面。 */
+  private static processHtml(text: string, notePrefix: string): WebPageFetched {
     const root = HtmlParser.parse(text);
     let title = '';
     const titleNode = HtmlParser.findFirst(root, 'title');
@@ -88,7 +120,7 @@ export class WebToBook {
       capped.push(p);
       chars += len;
     }
-    const note = truncated ? `正文超过 ${MAX_PAGE_CHARS} 字，已截断` : '';
+    const note = truncated ? `${notePrefix}正文超过 ${MAX_PAGE_CHARS} 字，已截断` : notePrefix;
     return { ok: true, note: note, title: title, paragraphs: capped, chars: chars };
   }
 
