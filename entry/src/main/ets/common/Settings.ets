@@ -25,6 +25,8 @@ export interface ProviderConfig {
 
 const STORE_NAME: string = 'app_settings';
 const KEY_CONFIG: string = 'provider_config';
+/** 按服务商记忆的 apiKey：baseUrl → key，存同一沙箱 preferences（与主配置同级别安全） */
+const KEY_KEYS: string = 'provider_keys';
 
 export class Settings {
   private static store: preferences.Preferences | null = null;
@@ -134,6 +136,59 @@ export class Settings {
     const p = await Settings.open();
     await p.put(KEY_CONFIG, JSON.stringify(cfg));
     await p.flush();
+    await Settings.rememberKey(cfg.baseUrl, cfg.apiKey);
+  }
+
+  /**
+   * 把 key 挂在 baseUrl 名下记一份。
+   *
+   * 目的：备模型切换。用户在 DeepSeek 和 GLM 之间来回切时，baseUrl/model
+   * 由预设一键填好，key 也该跟着自动回填——否则紧急切换还要手忙脚乱地
+   * 翻找粘贴 key。key 不换存储方式，还是同一个应用沙箱里的 preferences，
+   * 只是按服务商分了格；不发网络、不进日志。
+   */
+  static async rememberKey(baseUrl: string, apiKey: string): Promise<void> {
+    const b = baseUrl.trim();
+    const k = apiKey.trim();
+    if (b.length === 0 || k.length === 0) {
+      return;
+    }
+    try {
+      const p = await Settings.open();
+      const map = await Settings.keyMap(p);
+      if (map[b] === k) {
+        return;
+      }
+      map[b] = k;
+      await p.put(KEY_KEYS, JSON.stringify(map));
+      await p.flush();
+    } catch (e) {
+      Log.w(`记忆 API Key 失败：${(e as Error).message}`);
+    }
+  }
+
+  /** 查某服务商记忆过的 key，没存过返回空串 */
+  static async savedKey(baseUrl: string): Promise<string> {
+    try {
+      const p = await Settings.open();
+      const map = await Settings.keyMap(p);
+      const k = map[baseUrl.trim()];
+      return k !== undefined && k !== null ? k : '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  private static async keyMap(p: preferences.Preferences): Promise<Record<string, string>> {
+    const raw = await p.get(KEY_KEYS, '');
+    if (typeof raw !== 'string' || raw.length === 0) {
+      return {};
+    }
+    try {
+      return JSON.parse(raw) as Record<string, string>;
+    } catch (e) {
+      return {};
+    }
   }
 
   /** 是否已经具备发起翻译的条件 */

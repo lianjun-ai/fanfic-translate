@@ -98,6 +98,8 @@ interface ReqBody {
   stream: boolean;
   thinking?: ThinkingShape;
   enable_thinking?: boolean;
+  /** GLM-5.3 系专用思考深度档位（该系不支持 thinking.disabled） */
+  reasoning_effort?: string;
   tools?: ToolDef[];
 }
 
@@ -164,6 +166,11 @@ export class LlmProvider {
     return cfg.baseUrl.toLowerCase().indexOf('dashscope') >= 0;
   }
 
+  /** 是否智谱官方接口（open.bigmodel.cn） */
+  private static isBigmodel(cfg: ProviderConfig): boolean {
+    return cfg.baseUrl.toLowerCase().indexOf('bigmodel') >= 0;
+  }
+
   /** 思维链模型（deepseek-reasoner / qwq 等）：思考是它的卖点，不能关 */
   private static isReasoner(cfg: ProviderConfig): boolean {
     const m = cfg.model.toLowerCase();
@@ -203,6 +210,17 @@ export class LlmProvider {
     // qwen-plus 这类别名不支持该参数，传了会 400。
     if (LlmProvider.isDashScope(cfg) && cfg.model.toLowerCase().startsWith('qwen3')) {
       body.enable_thinking = false;
+    }
+    // 智谱：5.3 系（含 5.3-flash/flashx）默认思考且【不支持 disabled】，传了直接报错，
+    // 只能降到 reasoning_effort=low 控制思考开销；更早的 5.2/5.1/4.x 仍支持 disabled。
+    if (LlmProvider.isBigmodel(cfg)) {
+      const m = cfg.model.toLowerCase();
+      if (m.indexOf('5.3') >= 0) {
+        body.reasoning_effort = 'low';
+      } else if (!LlmProvider.isReasoner(cfg)) {
+        const off: ThinkingShape = { type: 'disabled' };
+        body.thinking = off;
+      }
     }
     if (tools !== null) {
       body.tools = tools;
