@@ -1,5 +1,6 @@
 import { http } from '@kit.NetworkKit';
 import { HeadlessRenderer } from './HeadlessRenderer';
+import { WebToBook } from './WebToBook';
 import { Log } from '../common/Logger';
 
 /**
@@ -73,6 +74,9 @@ export class WebPage {
           Log.i(`fetch_page 渲染降级成功：${url}`);
         } else {
           Log.w(`fetch_page 渲染降级失败：${rendered.note}`);
+          if (text.length < SHELL_TEXT_CHARS) {
+            note = '页面是 JS 动态渲染但内置渲染后仍无正文' + WebToBook.embeddedStateHint(html);
+          }
         }
       }
       let truncated = false;

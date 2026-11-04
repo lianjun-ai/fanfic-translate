@@ -18,9 +18,9 @@ import { Log } from '../common/Logger';
  *
  * 能力边界：
  * - web_search    发现线索（便宜）
- * - fetch_page    自己看网页内容（便宜，能判断链接是不是目标作品）
+ * - fetch_page    自己看网页内容（便宜，能判断链接是不是目标作品；JS 页自动走内置渲染）
  * - fichub_get    把作品页变成 EPUB 放进待入库区（英文同文库一步到位）
- * - html_to_book  把静态网页（单页或多页连载）抓成本地书（FicHub 不支持的站点的兜底路）
+ * - html_to_book  把网页（单页或多页连载）抓成本地书，JS 页自动走内置渲染（FicHub 不支持的站点的兜底路）
  * - download_file 直接下载任意文件（便宜，适合已经拿到直链）
  *
  * FicHub 只是其中一个可选工具 —— 模型完全可以只用 download_file 拿直链，
@@ -132,7 +132,7 @@ export class FinderTools {
       type: 'function',
       function: {
         name: 'fetch_page',
-        description: '打开一个网页并读它的可见正文（脚本样式会被去掉，长页面截断）。用来确认某个链接是不是那篇文、看章节数量、读推荐榜单',
+        description: '打开一个网页并读它的可见正文（脚本样式会被去掉，长页面截断）。用来确认某个链接是不是那篇文、看章节数量、读推荐榜单。JS 动态渲染的页面会自动用内置浏览器渲染后读取（每页要多等十几秒），但只读网页，不会把网页变成书',
         parameters: pageParams
       }
     };
@@ -156,7 +156,7 @@ export class FinderTools {
       type: 'function',
       function: {
         name: 'html_to_book',
-        description: '把网页抓成本地书放进待入库区（FicHub 不支持的站点的兜底路，如 LOFTER、晋江免费章节、博客、论坛帖子串）。urls 按阅读顺序传数组，每个网页合成一章；只抓一个网页时也可以只传一个元素的数组。只对「网页源码里就有正文」的静态页面有效，需要登录、JS 动态渲染或强反爬的页面会抓不到正文而失败',
+        description: '把网页抓成本地书放进待入库区（FicHub 不支持的站点的兜底路，如 LOFTER、晋江免费章节、博客、论坛帖子串）。urls 按阅读顺序传数组，每个网页合成一章；只抓一个网页时也可以只传一个元素的数组。JS 动态渲染的页面会自动用内置浏览器渲染后抽取（每页要多等十几秒）；需要登录才能看、内容主要是图片或反爬极强的页面才会抓不到正文而失败',
         parameters: JSON.parse(
           '{"type":"object","properties":{"urls":{"type":"array","items":{"type":"string"},"description":"按阅读顺序排列的网页地址，1~30 个"},"title":{"type":"string","description":"书名，不填就用第一个网页的标题"},"author":{"type":"string","description":"作者"}},"required":["urls"]}')
       }
@@ -417,7 +417,7 @@ export class FinderTools {
     if (pages.length === 0) {
       const why = failedNotes.join('；');
       return FinderTools.reply('fail',
-        `所有页面都没抓到正文。${why}。这类页面通常需要登录或是 JS 动态渲染（微博、小红书等），` +
+        `所有页面都没抓到正文（已尝试直接抓取和内置浏览器渲染）。${why}。这类页面通常需要登录后才能看，或内容主要是图片、反爬极强（微博、小红书、番茄等），` +
         '可以建议用户：在浏览器里打开文章、等正文显示后把链接分享给本应用，或复制正文存成 TXT 从「导入本地文件」进来',
         null, '', st);
     }

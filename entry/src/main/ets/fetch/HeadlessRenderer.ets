@@ -132,7 +132,7 @@ export class HeadlessRenderer {
       let reading = -1;
       try {
         const raw = await ctrl.runJavaScript(lengthScript);
-        reading = parseInt(raw, 10);
+        reading = parseInt(HeadlessRenderer.unwrap(raw), 10);
         if (isNaN(reading)) {
           reading = -1;
         }
@@ -154,7 +154,7 @@ export class HeadlessRenderer {
     // 4. 抽取渲染后的完整文档
     let html = '';
     try {
-      html = await ctrl.runJavaScript('document.documentElement.outerHTML');
+      html = HeadlessRenderer.unwrap(await ctrl.runJavaScript('document.documentElement.outerHTML'));
     } catch (e) {
       return { ok: false, html: '', note: `抽取渲染结果失败：${(e as Error).message}` };
     }
@@ -169,6 +169,27 @@ export class HeadlessRenderer {
     }
     Log.i(`内置渲染完成：${url}（HTML ${html.length} 字符，正文文本约 ${Math.max(last, 0)} 字符）`);
     return { ok: true, html: html, note: '' };
+  }
+
+  /**
+   * ArkWeb runJavaScript 返回的是结果的 JSON 序列化形式：
+   * 字符串会被包上引号，< 变 \u003C、换行变 \n 字面量。
+   * 不解码的话整份 HTML 就是一段转义文本，解析器读不出任何标签。
+   * 首尾带引号且能 JSON.parse 成功才解码，其余原样返回。
+   */
+  private static unwrap(result: string): string {
+    const s = result.trim();
+    if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+      try {
+        const decoded = JSON.parse(s) as string;
+        if (typeof decoded === 'string') {
+          return decoded;
+        }
+      } catch (e) {
+        // 不是合法 JSON 字符串，按原样返回
+      }
+    }
+    return result;
   }
 
   /** 首次请求时让宿主挂载 Web 组件，并等 controller attach */
