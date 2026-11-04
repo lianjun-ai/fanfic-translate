@@ -137,7 +137,8 @@ export class WebToBook {
     if (paragraphs.length === 0) {
       return {
         ok: false, title: title, paragraphs: [], chars: 0,
-        note: '页面里没有正文（需要登录才能看、内容主要是图片、或反爬拦截；JS 动态渲染的页面已自动用内置浏览器渲染过）' + WebToBook.embeddedStateHint(text)
+        note: '页面里没有正文（需要登录才能看、内容主要是图片、或反爬拦截；JS 动态渲染的页面已自动用内置浏览器渲染过）'
+          + WebToBook.embeddedStateHint(text) + WebToBook.weiboHint(text)
       };
     }
     const capped = WebToBook.capParagraphs(paragraphs);
@@ -187,6 +188,21 @@ export class WebToBook {
       return '';
     }
     return `；检测到页面源码内嵌了数据（${found.join('、')}），正文可能在里面但本应用尚未适配该站的数据结构`;
+  }
+
+  /**
+   * 微博的失败原因要分清楚，别一概说成「要 Cookie」（实测 2026-11）：
+   * - 单条微博（m.weibo.cn/status/…、weibo.com/…/status/…）：无 Cookie 落到
+   *   Sina Visitor System 验证页；拿到访客令牌也只是 SPA 空壳，内容接口回
+   *   {"ok":-100, url:"…/sso/signin"} —— 要的是登录态，应用给不了；
+   * - 头条文章（weibo.com/ttarticle/p/show?id=…）：免登录，直抓就有全文。
+   * 把这条写进失败回包，调用方模型才不会对文章页也判死刑。
+   */
+  private static weiboHint(text: string): string {
+    if (text.indexOf('Sina Visitor System') >= 0 || text.indexOf('visitor.passport.weibo') >= 0) {
+      return '；这是微博的访客验证页：单条微博需要登录态 Cookie，应用拿不到——但微博「头条文章」（weibo.com/ttarticle/p/show?id=…）免登录可抓，若这篇是长文形式可换文章链接再试；否则只能请用户在浏览器打开后分享链接，或复制正文存成 TXT 导入';
+    }
+    return '';
   }
 
   /** 取 <meta property|name="..."> 的 content */

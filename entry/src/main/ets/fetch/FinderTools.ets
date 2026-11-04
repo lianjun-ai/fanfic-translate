@@ -2,6 +2,7 @@ import { fileIo as fs } from '@kit.CoreFileKit';
 import { ToolDef } from '../provider/LlmProvider';
 import { FicHub, FicMeta, ProbeResult } from './FicHub';
 import { HttpFetch } from './HttpFetch';
+import { LinkItem, WebList } from './WebList';
 import { WebChapter, WebPageFetched, WebToBook } from './WebToBook';
 import { SiteRules, SiteRule } from './SiteRules';
 import { FileTextReader } from '../parser/FileTextReader';
@@ -12,6 +13,11 @@ import { Tavily, TavilyHit } from './Tavily';
 import { WebPage, PageResult } from './WebPage';
 import { FinderCtx, MAX_ROUNDS, ROUNDS_WARN_AT } from './FinderTypes';
 import { Log } from '../common/Logger';
+
+/** http_probe 每回合的次数上限（防模型靠试探烧光步数） */
+const MAX_PROBES: number = 6;
+/** http_probe 回包保留的最大字符数 */
+const MAX_PROBE_CHARS: number = 20000;
 
 /**
  * 找文 Agent 的工具箱。
@@ -116,6 +122,31 @@ interface LogsReply {
   hint: string;
 }
 
+/** list_links 的回包 */
+interface LinksReply {
+  status: string;
+  note: string;
+  count: number;
+  links: LinkItem[];
+  steps_left: number;
+  hint: string;
+}
+
+/** http_probe 的回包 */
+interface ProbeReply {
+  status: string;
+  code: number;
+  content_type: string;
+  chars: number;
+  truncated: boolean;
+  text: string;
+  markers: string[];
+  probes_left: number;
+  note: string;
+  steps_left: number;
+  hint: string;
+}
+
 /** 一次回合里工具执行的可变状态 */
 export interface FinderState {
   hits: FicMeta[];
@@ -124,11 +155,13 @@ export interface FinderState {
   probed: Record<string, FicMeta>;
   /** 当前是第几轮（由主循环每轮开头写入），工具据此算出还剩几步 */
   round: number;
+  /** 本回合已用掉的 http_probe 次数（防模型乱探接口烧步数） */
+  probes: number;
 }
 
 export class FinderTools {
   static newState(): FinderState {
-    return { hits: [], downloaded: [], probed: {}, round: 0 };
+    return { hits: [], downloaded: [], probed: {}, round: 0, probes: 0 };
   }
 
   /**
@@ -227,7 +260,25 @@ export class FinderTools {
           '{"type":"object","properties":{"lines":{"type":"integer","description":"要看最近多少条，默认 80"}}}')
       }
     };
-    return [webSearch, fetchPage, probe, webBook, download, debugFetch, manageRules, readLogs];
+    const listLinks: ToolDef = {
+      type: 'function',
+      function: {
+        name: 'list_links',
+        description: '列出网页上的链接清单。对 LOFTER 博客（传博客主页或任意一篇帖子的链接）会自动走 LOFTER 归档接口拿到整个博客的文章清单（标题+链接+发布日期，按时间正序），免登录——抓 LOFTER 系列文/合集先用它拿章节目录，再挑出目标章节的 url 传给 html_to_book。keyword 可按标题过滤。其它站点则解析页面里的站内 <a> 链接',
+        parameters: JSON.parse(
+          '{"type":"object","properties":{"url":{"type":"string","description":"LOFTER 博客主页或该博客任意一篇帖子的链接；其它站点传列表页/目录页地址"},"keyword":{"type":"string","description":"可选，只返回标题含此关键字的条目"}},"required":["url"]}')
+      }
+    };
+    const httpProbeDef: ToolDef = {
+      type: 'function',
+      function: {
+        name: 'http_probe',
+        description: '直接发一个 HTTP 请求看原始响应（受限：只支持 GET/POST、不能带 Cookie 或自定义头部，只能加 Referer）。用来探某个站的内部接口——页面直抓只有空壳、又没有内嵌数据标记时，可以试它的 JSON/DWR 接口：从脚本里找到可疑地址后先 GET，再试 POST 表单参数，报错原文本身就是线索。每回合最多 6 次；探到规律就用 manage_site_rules 落地规则或直接 html_to_book 验证，不要一直试探',
+        parameters: JSON.parse(
+          '{"type":"object","properties":{"url":{"type":"string","description":"接口地址，http/https"},"method":{"type":"string","enum":["GET","POST"],"description":"默认 GET"},"body":{"type":"string","description":"POST 请求体；body_type=form 时形如 a=1&b=2，json 时是 JSON 文本"},"body_type":{"type":"string","enum":["form","json"],"description":"请求体类型，默认 form"},"referer":{"type":"string","description":"可选，Referer 头（很多站会校验）"},"max_chars":{"type":"integer","description":"返回文本保留多少字符，默认 6000，上限 20000"}},"required":["url"]}')
+      }
+    };
+    return [webSearch, fetchPage, probe, webBook, download, debugFetch, manageRules, readLogs, listLinks, httpProbeDef];
   }
 
   /** 执行一次工具调用，返回喂回模型的 JSON */
@@ -255,6 +306,12 @@ export class FinderTools {
     }
     if (name === 'read_recent_logs') {
       return FinderTools.readRecentLogs(args, ctx, st);
+    }
+    if (name === 'list_links') {
+      return FinderTools.listLinks(args, ctx, st);
+    }
+    if (name === 'http_probe') {
+      return FinderTools.httpProbe(args, ctx, st);
     }
     return FinderTools.reply('bad_tool', `没有名为 ${name} 的工具`, null, '', st);
   }
@@ -636,7 +693,9 @@ export class FinderTools {
       preview: visible.length > 0 ? visible.substring(0, 300) : '',
       note: markers.length > 0 && hit === null
         ? '页面内嵌了数据但规则未命中：正文多半就在源码 JSON 里，可用 manage_site_rules(add) 按 data_outline 里的路径写规则'
-        : (visible.length < 300 && markers.length === 0 ? '可见文本极少：可能是 JS 动态渲染（数据在接口里），只能内置渲染抓，或需要登录' : ''),
+        : (visible.length < 300 && markers.length === 0
+          ? '可见文本极少：可能是 JS 动态渲染（数据在接口里），只能内置渲染抓，或需要登录。有把握的话可用 http_probe 试探该站的数据接口'
+          : ''),
       steps_left: b.steps_left,
       hint: b.hint
     };
@@ -694,6 +753,145 @@ export class FinderTools {
       hint: b.hint
     };
     return JSON.stringify(payload);
+  }
+
+  /** list_links：列出网页链接目录（LOFTER 走归档接口，其它站解析 <a>） */
+  private static async listLinks(args: Record<string, Object>, ctx: FinderCtx, st: FinderState): Promise<string> {
+    const url = FinderTools.str(args, 'url');
+    const keyword = FinderTools.str(args, 'keyword');
+    if (url.length === 0) {
+      return FinderTools.reply('bad_args', 'url 不能为空', null, '', st);
+    }
+    const res = await WebList.list(url, keyword);
+    const b = FinderTools.budget(st);
+    ctx.hooks.onAction(res.ok ? `🔗 已列出链接清单（${res.items.length} 条）` : '🔗 列链接清单失败');
+    const capped = res.items.slice(0, 120);
+    const payload: LinksReply = {
+      status: res.ok ? 'ok' : 'failed',
+      note: res.note,
+      count: res.items.length,
+      links: capped,
+      steps_left: b.steps_left,
+      hint: b.hint
+    };
+    return JSON.stringify(payload);
+  }
+
+  /**
+   * http_probe：受限的原始请求。给模型探内部接口的能力，但把风险收窄：
+   * 只 GET/POST、不能带 Cookie/自定义头、只许 Referer、禁内网地址、
+   * 每回合次数上限，响应截断后再回包。
+   */
+  private static async httpProbe(args: Record<string, Object>, ctx: FinderCtx, st: FinderState): Promise<string> {
+    const url = FinderTools.str(args, 'url');
+    let method = FinderTools.str(args, 'method');
+    method = method.length > 0 ? method.toUpperCase() : 'GET';
+    const body = FinderTools.str(args, 'body');
+    const bodyType = FinderTools.str(args, 'body_type');
+    const referer = FinderTools.str(args, 'referer');
+    const maxChars = Math.min(FinderTools.int(args, 'max_chars', 6000), MAX_PROBE_CHARS);
+    const b = FinderTools.budget(st);
+    if (url.length === 0) {
+      return FinderTools.reply('bad_args', 'url 不能为空', null, '', st);
+    }
+    if (!/^https?:\/\//i.test(url)) {
+      return FinderTools.reply('bad_args', '只支持 http/https 地址', null, '', st);
+    }
+    const host = FinderTools.hostOfUrl(url);
+    if (FinderTools.isPrivateHost(host)) {
+      return FinderTools.reply('bad_args', '不允许访问本机/内网地址', null, '', st);
+    }
+    if (st.probes >= MAX_PROBES) {
+      const limited: ProbeReply = {
+        status: 'limited', code: 0, content_type: '', chars: 0, truncated: false,
+        text: '', markers: [], probes_left: 0,
+        note: `本回合 ${MAX_PROBES} 次原始请求已用完。别再试探接口了：用手上已有的线索给结论，或建议用户换路`,
+        steps_left: b.steps_left, hint: b.hint
+      };
+      return JSON.stringify(limited);
+    }
+    st.probes++;
+    const res = await HttpFetch.request(method, url, referer, body, bodyType);
+    Log.i(`http_probe ${method} ${url} → HTTP ${res.code}，${res.text.length} 字符`);
+    const full = res.text;
+    let text = full;
+    const truncated = full.length > maxChars;
+    if (truncated) {
+      text = full.substring(0, maxChars);
+    }
+    const markers = SiteRules.markersIn(full);
+    const payload: ProbeReply = {
+      status: res.ok ? 'ok' : (res.code === 0 ? 'error' : 'http_error'),
+      code: res.code,
+      content_type: res.contentType,
+      chars: full.length,
+      truncated: truncated,
+      text: text,
+      markers: markers,
+      probes_left: MAX_PROBES - st.probes,
+      note: res.note.length > 0 ? res.note : FinderTools.probeHint(full),
+      steps_left: b.steps_left,
+      hint: b.hint
+    };
+    ctx.hooks.onAction(`🛰️ 已请求接口（HTTP ${res.code}）`);
+    return JSON.stringify(payload);
+  }
+
+  /** 根据响应形态给一句判读提示，省模型一轮推理 */
+  private static probeHint(text: string): string {
+    const t = text.trim();
+    if (t.indexOf('//#DWR-REPLY') >= 0) {
+      return '这是 DWR 接口的返回：带 _remoteHandleCallback 说明成功，带 _remoteHandleException 说明参数不对（报错原文会说明缺什么）';
+    }
+    if (t.startsWith('{') || t.startsWith('[')) {
+      return '响应是 JSON/JS 对象：可以据此推断字段路径，用 manage_site_rules(marker + json_content) 把它变成站点规则';
+    }
+    if (t.indexOf('<html') >= 0 || t.indexOf('<!DOCTYPE') >= 0) {
+      return '响应是 HTML：可能被重定向到登录/验证页，或接口地址不对';
+    }
+    if (t.length === 0) {
+      return '响应是空的：接口可能需要别的参数或鉴权';
+    }
+    return '响应是纯文本，看内容判断是否为接口数据';
+  }
+
+  private static hostOfUrl(url: string): string {
+    const m = /^https?:\/\/([^/?#]+)/i.exec(url);
+    if (m === null || m.length < 2) {
+      return '';
+    }
+    let host = m[1].toLowerCase();
+    const colon = host.indexOf(':');
+    if (colon >= 0) {
+      host = host.substring(0, colon);
+    }
+    return host;
+  }
+
+  /** 只拦本机与内网网段，不做严格域名白名单（要探的是任意长尾站） */
+  private static isPrivateHost(host: string): boolean {
+    if (host.length === 0) {
+      return true;
+    }
+    if (host === 'localhost' || host === '0.0.0.0' || host === '::1' || host === '[::1]') {
+      return true;
+    }
+    if (host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.lan')) {
+      return true;
+    }
+    if (host.startsWith('127.') || host.startsWith('10.') || host.startsWith('192.168.') || host.startsWith('169.254.')) {
+      return true;
+    }
+    if (host.startsWith('172.')) {
+      const parts = host.split('.');
+      if (parts.length >= 2) {
+        const second = parseInt(parts[1], 10);
+        if (second >= 16 && second <= 31) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   private static bool(args: Record<string, Object>, key: string, def: boolean): boolean {

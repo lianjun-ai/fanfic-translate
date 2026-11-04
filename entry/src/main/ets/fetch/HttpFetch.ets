@@ -15,11 +15,124 @@ const MAX_DOWNLOAD_BYTES: number = 60 * 1024 * 1024;
 
 const UA: string = 'Mozilla/5.0 (Linux; HarmonyOS) AppleWebKit/537.36 (KHTML, like Gecko) Mobile Safari/537.36';
 
+/** getText / postForm / request 的返回 */
+export interface FetchTextResult {
+  ok: boolean;
+  code: number;
+  text: string;
+  note: string;
+  /** 响应 Content-Type，request 会填，其它方法留空 */
+  contentType: string;
+}
+
 /**
  * 裸 HTTP 文件下载，供 download_file 与网页抓书共用。
  * 只做「把字节落到临时目录」这一件事，格式判断和入库都由调用方决定。
  */
 export class HttpFetch {
+  /** GET 一个 URL，返回响应文本（跟随重定向后的最终内容） */
+  static async getText(url: string, referer: string): Promise<FetchTextResult> {
+    const req = http.createHttp();
+    try {
+      const header: Record<string, string> = {
+        'Accept': 'text/html,application/json,*/*',
+        'User-Agent': UA
+      };
+      if (referer.length > 0) {
+        header['Referer'] = referer;
+      }
+      const options: http.HttpRequestOptions = {
+        method: http.RequestMethod.GET,
+        header: header,
+        expectDataType: http.HttpDataType.STRING,
+        connectTimeout: 15000,
+        readTimeout: 30000
+      };
+      const resp = await req.request(url, options);
+      const text = typeof resp.result === 'string' ? resp.result : '';
+      return { ok: resp.responseCode >= 200 && resp.responseCode < 300, code: resp.responseCode, text: text, note: '', contentType: '' };
+    } catch (e) {
+      return { ok: false, code: 0, text: '', note: `网络错误：${(e as Error).message}`, contentType: '' };
+    } finally {
+      req.destroy();
+    }
+  }
+
+  /** POST 表单（application/x-www-form-urlencoded），返回响应文本 */
+  static async postForm(url: string, form: Record<string, string>, referer: string): Promise<FetchTextResult> {
+    const req = http.createHttp();
+    try {
+      const parts: string[] = [];
+      const keys = Object.keys(form);
+      for (let i = 0; i < keys.length; i++) {
+        parts.push(`${encodeURIComponent(keys[i])}=${encodeURIComponent(form[keys[i]])}`);
+      }
+      const header: Record<string, string> = {
+        'Accept': '*/*',
+        'User-Agent': UA,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      };
+      if (referer.length > 0) {
+        header['Referer'] = referer;
+      }
+      const options: http.HttpRequestOptions = {
+        method: http.RequestMethod.POST,
+        header: header,
+        extraData: parts.join('&'),
+        expectDataType: http.HttpDataType.STRING,
+        connectTimeout: 15000,
+        readTimeout: 30000
+      };
+      const resp = await req.request(url, options);
+      const text = typeof resp.result === 'string' ? resp.result : '';
+      return { ok: resp.responseCode >= 200 && resp.responseCode < 300, code: resp.responseCode, text: text, note: '', contentType: '' };
+    } catch (e) {
+      return { ok: false, code: 0, text: '', note: `网络错误：${(e as Error).message}`, contentType: '' };
+    } finally {
+      req.destroy();
+    }
+  }
+
+  /**
+   * 受限的原始请求：只支持 GET / POST，头部只允许 Referer 与 bodyType 决定的
+   * Content-Type。给 finder 智能体探接口用 —— 没有任意头、没有 Cookie，
+   * 避免它带着会话凭证乱发请求。
+   */
+  static async request(method: string, url: string, referer: string, body: string, bodyType: string): Promise<FetchTextResult> {
+    const req = http.createHttp();
+    try {
+      const isPost = method.toUpperCase() === 'POST';
+      const header: Record<string, string> = { 'Accept': '*/*', 'User-Agent': UA };
+      if (referer.length > 0) {
+        header['Referer'] = referer;
+      }
+      const options: http.HttpRequestOptions = {
+        method: isPost ? http.RequestMethod.POST : http.RequestMethod.GET,
+        header: header,
+        expectDataType: http.HttpDataType.STRING,
+        connectTimeout: 15000,
+        readTimeout: 30000
+      };
+      if (isPost && body.length > 0) {
+        header['Content-Type'] = bodyType === 'json'
+          ? 'application/json'
+          : 'application/x-www-form-urlencoded';
+        options.extraData = body;
+      }
+      const resp = await req.request(url, options);
+      const text = typeof resp.result === 'string' ? resp.result : '';
+      return {
+        ok: resp.responseCode >= 200 && resp.responseCode < 300,
+        code: resp.responseCode, text: text, note: '',
+        contentType: HttpFetch.headerOf(resp, 'content-type')
+      };
+    } catch (e) {
+      return { ok: false, code: 0, text: '', note: `网络错误：${(e as Error).message}`, contentType: '' };
+    } finally {
+      req.destroy();
+    }
+  }
+
   static async toFile(url: string, dir: string): Promise<FetchFileResult> {
     if (!fs.accessSync(dir)) {
       fs.mkdirSync(dir, true);
