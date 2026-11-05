@@ -7,6 +7,7 @@ import { AgentHooks, FinderResult, RunControl } from '../fetch/FinderTypes';
 import { FinderAgent } from '../fetch/FinderAgent';
 import { HeadlessRenderer } from '../fetch/HeadlessRenderer';
 import { PendingItem, PendingStore } from '../fetch/PendingStore';
+import { Bubble, SessionData, SessionMeta, SessionStore } from '../fetch/SessionStore';
 import { ChatMessage } from '../provider/LlmProvider';
 import { ProviderConfig, Settings } from '../common/Settings';
 import { Log } from '../common/Logger';
@@ -14,18 +15,6 @@ import { Log } from '../common/Logger';
 /** 从系统分享进入时带进来的路由参数 */
 interface SearchPageParams {
   sharedUrl: string;
-}
-
-/**
- * 对话流里的一条气泡。
- * kind: user（我说的话）/ think（模型思考）/ action（工具动作）/ hit（命中作品卡片）
- *       / reply（模型回复）/ error（失败）
- */
-interface Bubble {
-  id: string;
-  kind: string;
-  text: string;
-  meta: FicMeta | null;
 }
 
 const EXAMPLES: string[] = [
@@ -68,6 +57,16 @@ struct SearchPage {
   @State streamText: string = '';
   @State streaming: boolean = false;
 
+  /** 当前会话：空串表示还没落盘（发出第一条消息时才建） */
+  private sessionId: string = '';
+  private sessionCreatedAt: number = 0;
+  @State sessionTitle: string = '';
+  /** 历史会话列表（最近更新在前） */
+  @State sessions: SessionMeta[] = [];
+  @State showSessions: boolean = false;
+  /** 落盘节流：一轮对话里气泡会密集变化，攒 400ms 写一次就够 */
+  private persistTimer: number = -1;
+
   /** 内置渲染器的隐藏 Web 组件：首次渲染请求才挂载（惰性），省启动内存 */
   @State showRendererWeb: boolean = false;
   private renderCtrl: webview.WebviewController = new webview.WebviewController();
@@ -75,6 +74,7 @@ struct SearchPage {
   aboutToAppear(): void {
     this.readRouteParams();
     this.loadPending();
+    this.restoreLastSession();
     HeadlessRenderer.setHost({
       requestMount: (): void => {
         this.showRendererWeb = true;
@@ -96,7 +96,166 @@ struct SearchPage {
    * loadUrl 会抛「must be associated with a Web component」。
    */
   aboutToDisappear(): void {
+    // 离开页面前把最后一版气泡写下去（节流器里可能还有没落盘的内容）
+    this.flushPersist();
     HeadlessRenderer.detachController(this.renderCtrl);
+  }
+
+  /**
+   * 回到页面时接着上次的会话。
+   * 有分享链接进来（query 已被预填）时不恢复：那是新任务，不该混进旧对话。
+   */
+  private restoreLastSession(): void {
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    if (this.query.length > 0) {
+      this.refreshSessions();
+      return;
+    }
+    SessionStore.list(ctx).then((list: SessionMeta[]) => {
+      this.sessions = list;
+      if (list.length === 0) {
+        return;
+      }
+      return SessionStore.load(ctx, list[0].id).then((data: SessionData | null) => {
+        if (data === null) {
+          return;
+        }
+        this.applySession(data);
+      });
+    }).catch((e: Error) => {
+      Log.w(`恢复会话失败：${e.message}`);
+    });
+  }
+
+  private applySession(data: SessionData): void {
+    this.sessionId = data.id;
+    this.sessionCreatedAt = data.createdAt;
+    this.sessionTitle = data.title;
+    this.bubbles = data.bubbles;
+    // 历史里的 system 是存那一刻的提示词，换成当前这份再接着聊
+    const kept: ChatMessage[] = [];
+    for (let i = 0; i < data.history.length; i++) {
+      if (data.history[i].role !== 'system') {
+        kept.push(data.history[i]);
+      }
+    }
+    const sys: ChatMessage = { role: 'system', content: FinderAgent.systemPrompt() };
+    this.history = [sys].concat(kept);
+    // 气泡 id 里带着旧的 seq（b12/h13…），接着往下编号才不会再撞 id
+    let maxSeq = 0;
+    for (let i = 0; i < data.bubbles.length; i++) {
+      const n = Number(data.bubbles[i].id.replace(/[^0-9]/g, ''));
+      if (n > maxSeq) {
+        maxSeq = n;
+      }
+    }
+    this.seq = maxSeq + 1;
+    this.expandedIds = [];
+    this.streamText = '';
+    this.streaming = false;
+    this.statusText = '';
+    this.scrollToBottom();
+  }
+
+  private refreshSessions(): void {
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    SessionStore.list(ctx).then((list: SessionMeta[]) => {
+      this.sessions = list;
+    }).catch(() => {
+    });
+  }
+
+  /** 发出第一条消息时建会话，标题取用户这句的前 24 字 */
+  private ensureSession(firstText: string): void {
+    if (this.sessionId.length > 0) {
+      return;
+    }
+    this.sessionId = SessionStore.newId();
+    this.sessionCreatedAt = Date.now();
+    const t = firstText.replace(/\s+/g, ' ').trim();
+    this.sessionTitle = t.length > 24 ? `${t.substring(0, 24)}…` : t;
+  }
+
+  private schedulePersist(): void {
+    if (this.sessionId.length === 0 || this.persistTimer >= 0) {
+      return;
+    }
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = -1;
+      this.persist();
+    }, 400);
+  }
+
+  private flushPersist(): void {
+    if (this.persistTimer >= 0) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = -1;
+    }
+    this.persist();
+  }
+
+  /** 落盘当前会话；没有气泡就不写（新建后还没说话的空会话不占列表） */
+  private persist(): void {
+    if (this.sessionId.length === 0 || this.bubbles.length === 0) {
+      return;
+    }
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    const data: SessionData = {
+      id: this.sessionId,
+      title: this.sessionTitle.length > 0 ? this.sessionTitle : '未命名会话',
+      createdAt: this.sessionCreatedAt,
+      updatedAt: Date.now(),
+      bubbles: this.bubbles,
+      history: this.history
+    };
+    SessionStore.save(ctx, data).then(() => {
+      this.refreshSessions();
+    }).catch((e: Error) => {
+      Log.w(`保存会话失败：${e.message}`);
+    });
+  }
+
+  /** 打开历史会话：先把当前这版存好，再换过去 */
+  private openSession(id: string): void {
+    if (this.busy) {
+      this.getUIContext().getPromptAction().showToast({ message: '先点输入框右边的「停止」结束这一轮' });
+      return;
+    }
+    if (id === this.sessionId) {
+      this.showSessions = false;
+      return;
+    }
+    this.flushPersist();
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    SessionStore.load(ctx, id).then((data: SessionData | null) => {
+      if (data === null) {
+        this.getUIContext().getPromptAction().showToast({ message: '这个会话已经读不到了' });
+        this.refreshSessions();
+        return;
+      }
+      this.applySession(data);
+      this.showSessions = false;
+    }).catch((e: Error) => {
+      Log.w(`打开会话失败：${e.message}`);
+    });
+  }
+
+  /** 删除一个会话；删的是当前这个就顺手清屏，回到空态 */
+  private removeSession(id: string): void {
+    if (this.busy) {
+      this.getUIContext().getPromptAction().showToast({ message: '先点输入框右边的「停止」结束这一轮' });
+      return;
+    }
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    SessionStore.remove(ctx, id).then(() => {
+      if (id === this.sessionId) {
+        this.resetToBlank();
+      }
+      this.refreshSessions();
+      this.getUIContext().getPromptAction().showToast({ message: '会话已删除' });
+    }).catch((e: Error) => {
+      Log.w(`删除会话失败：${e.message}`);
+    });
   }
 
   /** 系统分享进来时预填链接，用户确认后自己发出去 */
@@ -120,6 +279,7 @@ struct SearchPage {
     const b: Bubble = { id: `b${this.seq}`, kind: kind, text: text, meta: null };
     this.bubbles = this.bubbles.concat([b]);
     this.scrollToBottom();
+    this.schedulePersist();
   }
 
   private pushHit(m: FicMeta): void {
@@ -127,6 +287,7 @@ struct SearchPage {
     const b: Bubble = { id: `h${this.seq}`, kind: 'hit', text: m.title, meta: m };
     this.bubbles = this.bubbles.concat([b]);
     this.scrollToBottom();
+    this.schedulePersist();
   }
 
   private isExpanded(id: string): boolean {
@@ -170,6 +331,8 @@ struct SearchPage {
     if (text.length === 0) {
       return;
     }
+    // 会话在第一次真正说话时建立（标题也取这句），空会话不占历史列表
+    this.ensureSession(text);
     const cfg = await Settings.load();
     if (!Settings.ready(cfg)) {
       this.pushBubble('user', text);
@@ -197,6 +360,8 @@ struct SearchPage {
       this.streaming = false;
       this.streamText = '';
       this.scrollToBottom();
+      // 这一轮的最终回复和工具调用都定稿了，立刻写盘
+      this.flushPersist();
     }
   }
 
@@ -234,6 +399,7 @@ struct SearchPage {
         const b: Bubble = { id: id, kind: isFinal ? 'reply' : 'think', text: text, meta: null };
         this.bubbles = this.bubbles.concat([b]);
         this.scrollToBottom();
+        this.schedulePersist();
       },
       onAction: (t: string) => {
         this.pushBubble('action', t);
@@ -279,6 +445,17 @@ struct SearchPage {
       this.getUIContext().getPromptAction().showToast({ message: '先点输入框右边的「停止」结束这一轮' });
       return;
     }
+    // 先把当前这版存进历史，再开新的——否则「新对话」等于把上文丢了
+    this.flushPersist();
+    this.resetToBlank();
+    this.showSessions = false;
+  }
+
+  /** 清屏回到空态，并断开与当前会话的绑定（下次说话才建新会话） */
+  private resetToBlank(): void {
+    this.sessionId = '';
+    this.sessionTitle = '';
+    this.sessionCreatedAt = 0;
     this.history = [];
     this.bubbles = [];
     this.expandedIds = [];
@@ -501,6 +678,16 @@ struct SearchPage {
         .fontWeight(FontWeight.Bold)
         .fontColor($r('app.color.text_primary'))
       Blank()
+      Text('历史')
+        .fontSize(13)
+        .fontColor($r('app.color.text_secondary'))
+        .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+        .backgroundColor($r('app.color.card_background'))
+        .borderRadius(13)
+        .onClick(() => {
+          this.refreshSessions();
+          this.showSessions = true;
+        })
       Text('新对话')
         .fontSize(13)
         .fontColor($r('app.color.brand_primary'))
@@ -828,8 +1015,135 @@ struct SearchPage {
     .padding({ left: $r('app.float.page_padding'), right: $r('app.float.page_padding'), top: 8, bottom: 10 })
   }
 
-  build() {
+  /** 列表里的时间：今年内只显示月-日 时:分，跨年补上年份 */
+  private sessionTime(ms: number): string {
+    const d = new Date(ms);
+    const now = new Date();
+    const p = (n: number): string => n < 10 ? `0${n}` : `${n}`;
+    if (d.getFullYear() === now.getFullYear()) {
+      return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    }
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  }
+
+  /**
+   * 历史会话面板：底部抽屉式，点上半屏空白处关闭。
+   * 当前会话高亮，右侧「删除」逐条删；底部「新对话」等于存好当前再开一个。
+   */
+  @Builder
+  sessionSheet() {
     Column() {
+      Column()
+        .layoutWeight(1)
+        .width('100%')
+        .onClick(() => {
+          this.showSessions = false;
+        })
+
+      Column() {
+        Row() {
+          Text('历史会话')
+            .fontSize(16)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.text_primary'))
+          Blank()
+          Text('关闭')
+            .fontSize(13)
+            .fontColor($r('app.color.text_secondary'))
+            .padding(4)
+            .onClick(() => {
+              this.showSessions = false;
+            })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 14, bottom: 10 })
+
+        if (this.sessions.length === 0) {
+          Text('还没有历史会话。发出第一条消息后会自动保存到这里。')
+            .fontSize(13)
+            .fontColor($r('app.color.text_tertiary'))
+            .lineHeight(20)
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 8, bottom: 16 })
+        } else {
+          List() {
+            ForEach(this.sessions, (m: SessionMeta) => {
+              ListItem() {
+                Row({ space: 8 }) {
+                  Column({ space: 4 }) {
+                    Text(m.title)
+                      .fontSize(14)
+                      .fontColor($r('app.color.text_primary'))
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      .width('100%')
+                    Text(`${m.count} 条 · ${this.sessionTime(m.updatedAt)}`)
+                      .fontSize(11)
+                      .fontColor($r('app.color.text_tertiary'))
+                      .width('100%')
+                  }
+                  .alignItems(HorizontalAlign.Start)
+                  .layoutWeight(1)
+
+                  if (m.id === this.sessionId) {
+                    Text('当前')
+                      .fontSize(10)
+                      .fontColor($r('app.color.brand_primary'))
+                      .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                      .backgroundColor($r('app.color.card_background'))
+                      .borderRadius(8)
+                  }
+                  Text('删除')
+                    .fontSize(12)
+                    .fontColor($r('app.color.danger'))
+                    .padding({ left: 8, right: 4, top: 8, bottom: 8 })
+                    .onClick(() => {
+                      this.removeSession(m.id);
+                    })
+                }
+                .width('100%')
+                .padding({ left: 16, right: 12, top: 10, bottom: 10 })
+                .backgroundColor(m.id === this.sessionId ? $r('app.color.card_background') : Color.Transparent)
+                .onClick(() => {
+                  this.openSession(m.id);
+                })
+              }
+            }, (m: SessionMeta) => `${m.id}_${m.updatedAt}`)
+          }
+          .layoutWeight(1)
+          .width('100%')
+          .scrollBar(BarState.Off)
+        }
+
+        Row() {
+          Button('＋ 新对话')
+            .width('100%')
+            .height(40)
+            .fontSize(14)
+            .backgroundColor($r('app.color.brand_primary'))
+            .fontColor(Color.White)
+            .borderRadius(20)
+            .enabled(!this.busy)
+            .onClick(() => {
+              this.newChat();
+            })
+        }
+        .width('100%')
+        .padding({ left: 16, right: 16, top: 6, bottom: 12 })
+      }
+      .width('100%')
+      .height('55%')
+      .backgroundColor($r('app.color.page_background'))
+      .borderRadius({ topLeft: 16, topRight: 16 })
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#66000000')
+  }
+
+  build() {
+    Stack() {
+      Column() {
       this.header()
 
       Scroll(this.scroller) {
@@ -907,5 +1221,13 @@ struct SearchPage {
     .width('100%')
     .height('100%')
     .backgroundColor($r('app.color.page_background'))
+
+      // 历史会话面板盖在最上层
+      if (this.showSessions) {
+        this.sessionSheet()
+      }
+    }
+    .width('100%')
+    .height('100%')
   }
 }

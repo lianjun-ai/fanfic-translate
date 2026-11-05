@@ -81,6 +81,14 @@ const MAX_HISTORY: number = 24;
 
 export class FinderAgent {
   /**
+   * 当前系统提示词。恢复历史会话时用它替换存下来的那一份 ——
+   * 否则老会话会带着几周前的提示词继续跑（提示词改过之后尤其明显）。
+   */
+  static systemPrompt(): string {
+    return FINDER_SYSTEM;
+  }
+
+  /**
    * 跑一个回合：把用户这条消息交给模型，循环执行它请求的工具，
    * 直到它给出不带 tool_calls 的回复（或轮次用尽）。
    * history 由调用方持有并跨回合复用 —— 这就是"对话记忆"。
