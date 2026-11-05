@@ -4,7 +4,10 @@ import { FicHub, FicMeta, ProbeResult } from './FicHub';
 import { HttpFetch } from './HttpFetch';
 import { LinkItem, WebList } from './WebList';
 import { WebChapter, WebPageFetched, WebToBook } from './WebToBook';
+import { SiteMirror } from './SiteMirror';
 import { SiteRules, SiteRule } from './SiteRules';
+import { ParsedParagraph } from '../parser/ParserTypes';
+import { AntiBot } from './AntiBot';
 import { FileTextReader } from '../parser/FileTextReader';
 import { HtmlParser } from '../parser/HtmlParser';
 import { XhtmlConverter } from '../parser/XhtmlConverter';
@@ -100,6 +103,10 @@ interface DebugReply {
   data_outline: string[];
   rule_hit: string;
   preview: string;
+  /** 内嵌 JSON 里最长的字符串有多少字：几十字=只有元信息（真 CSR），上千字=正文在里面 */
+  json_max_text: number;
+  /** 实际抓的等效地址（发生了站点镜像时才有值，否则空串） */
+  mirrored_from: string;
   note: string;
   steps_left: number;
   hint: string;
@@ -204,7 +211,7 @@ export class FinderTools {
       type: 'function',
       function: {
         name: 'fetch_page',
-        description: '打开一个网页并读它的可见正文（脚本样式会被去掉，长页面截断）。用来确认某个链接是不是那篇文、看章节数量、读推荐榜单。JS 动态渲染的页面会自动用内置浏览器渲染后读取（每页要多等十几秒），但只读网页，不会把网页变成书',
+        description: '打开一个网页并读它的可见正文（脚本样式会被去掉，长页面截断）。用来确认某个链接是不是那篇文、看章节数量、读推荐榜单。JS 动态渲染的页面会自动用内置浏览器渲染后读取（每页要多等十几秒），裸请求被风控 403 时也会自动改用内置浏览器重试一次（真浏览器能过 JS 挑战页，如知乎），但只读网页，不会把网页变成书',
         parameters: pageParams
       }
     };
@@ -228,7 +235,7 @@ export class FinderTools {
       type: 'function',
       function: {
         name: 'html_to_book',
-        description: '把网页抓成本地书放进待入库区（FicHub 不支持的站点的兜底路，如 LOFTER、晋江免费章节、博客、论坛帖子串）。urls 按阅读顺序传数组，每个网页合成一章；只抓一个网页时也可以只传一个元素的数组。命中站点规则的站会按规则直接抽取（快）；否则静态页直抓、JS 动态渲染的页面自动用内置浏览器渲染后抽取（每页要多等十几秒）；需要登录才能看、内容主要是图片或反爬极强的页面才会抓不到正文而失败',
+        description: '把网页抓成本地书放进待入库区（FicHub 不支持的站点的兜底路，如 LOFTER、晋江免费章节、博客、论坛帖子串）。urls 按阅读顺序传数组，每个网页合成一章；只抓一个网页时也可以只传一个元素的数组。命中站点规则的站会按规则直接抽取（快）；否则静态页直抓、JS 动态渲染的页面自动用内置浏览器渲染后抽取（每页要多等十几秒）；裸请求被风控 403 时也会自动改用内置浏览器重试一次（能过知乎这类 JS 挑战页）；需要登录才能看、内容主要是图片或人机验证的页面才会抓不到正文而失败',
         parameters: JSON.parse(
           '{"type":"object","properties":{"urls":{"type":"array","items":{"type":"string"},"description":"按阅读顺序排列的网页地址，1~30 个"},"title":{"type":"string","description":"书名，不填就用第一个网页的标题"},"author":{"type":"string","description":"作者"}},"required":["urls"]}')
       }
@@ -246,9 +253,9 @@ export class FinderTools {
       type: 'function',
       function: {
         name: 'manage_site_rules',
-        description: '查看或维护「站点抓取规则」。规则告诉 html_to_book 怎么从某个站抽正文，两种写法：①内嵌数据规则：marker（源码里的 JSON 定位标记，如 __initialize_data__）+ json_content（正文在 JSON 里的点分路径，如 postData.data.postView.content），可选 json_title；②元素规则：selector 定位正文容器（如 div.post-content、article）。action=list 列出现有规则；action=add 添加或按 url_pattern 覆盖（先用 debug_fetch 的 data_outline 推断路径，写完直接重试 html_to_book 验证）；action=remove 删除自定义规则（内置规则不可删）。规则存本地，立即生效，不用重新装应用',
+        description: '查看或维护「站点抓取规则」。规则告诉 html_to_book 怎么从某个站抽正文，两种写法：①内嵌数据规则：marker（源码里的 JSON 定位标记，如 __initialize_data__）+ json_content（正文在 JSON 里的点分路径，如 postData.data.postView.content），可选 json_title；②元素规则：selector 定位正文容器（如 div.post-content、article）。action=list 列出现有规则（含哪些被临时停用）；action=add 添加或按 url_pattern 覆盖（先用 debug_fetch 的 data_outline 推断路径，写完直接重试 html_to_book 验证）；action=remove 删除自定义规则（内置规则不可删）；action=disable 临时停用某条规则（内置规则也能停：用来验证这条规则是不是唯一依赖，或让这个站从头走通用解析）；action=enable 恢复。规则存本地，立即生效，不用重新装应用',
         parameters: JSON.parse(
-          '{"type":"object","properties":{"action":{"type":"string","enum":["list","add","remove"],"description":"list=列出全部规则，add=添加/覆盖，remove=删除"},"url_pattern":{"type":"string","description":"URL 匹配子串，如 lofter.com/post；命中即用这条规则"},"marker":{"type":"string","description":"内嵌 JSON 定位标记"},"json_title":{"type":"string","description":"标题的点分路径，可空（配合 title_from_first_paragraph）"},"json_content":{"type":"string","description":"正文 HTML 的点分路径"},"selector":{"type":"string","description":"正文容器选择器（tag.class / .class / #id / tag）"},"title_from_first_paragraph":{"type":"boolean","description":"无标题时用首段前 40 字当书名，默认 true"},"note":{"type":"string","description":"规则备注，如站点名"}},"required":["action"]}')
+          '{"type":"object","properties":{"action":{"type":"string","enum":["list","add","remove","disable","enable"],"description":"list=列出全部规则（标注停用项），add=添加/覆盖，remove=删除，disable=临时停用，enable=恢复"},"url_pattern":{"type":"string","description":"URL 匹配子串，如 lofter.com/post；命中即用这条规则"},"marker":{"type":"string","description":"内嵌 JSON 定位标记"},"json_title":{"type":"string","description":"标题的点分路径，可空（配合 title_from_first_paragraph）"},"json_content":{"type":"string","description":"正文 HTML 的点分路径"},"selector":{"type":"string","description":"正文容器选择器（tag.class / .class / #id / tag）。加 all: 前缀（如 all:div.content）会收集全部匹配的容器并按文档顺序拼接，用于贴吧这类每层楼正文各占一个容器的页面"},"title_from_first_paragraph":{"type":"boolean","description":"无标题时用首段前 40 字当书名，默认 true"},"note":{"type":"string","description":"规则备注，如站点名"}},"required":["action"]}')
       }
     };
     const readLogs: ToolDef = {
@@ -557,14 +564,31 @@ export class FinderTools {
     const workTitle = titleArg.length > 0 ? titleArg
       : (pages[0].title.length > 0 ? pages[0].title : '未命名作品');
     const authorArg = FinderTools.str(args, 'author');
-    const chapters: WebChapter[] = [];
+    // 网页分页是站方切的，和「章」不是一回事：贴吧一帖里塞好几章，一章也会
+    // 被页边界劈开。先把各页段落按顺序拼成一条，再按文内标题切；标题不够
+    // 两个才退回「一页一章」。
+    const merged: ParsedParagraph[] = [];
     for (let i = 0; i < pages.length; i++) {
-      const p = pages[i];
-      // 多页时每页一章，章名用页面标题；单页时章名就是书名
-      const name = pages.length > 1
-        ? (p.title.length > 0 ? p.title : `第 ${chapters.length + 1} 章`)
-        : workTitle;
-      chapters.push({ title: name, paragraphs: p.paragraphs });
+      for (let j = 0; j < pages[i].paragraphs.length; j++) {
+        merged.push(pages[i].paragraphs[j]);
+      }
+    }
+    const chapters: WebChapter[] = [];
+    const byHead = WebToBook.splitChapters(merged);
+    if (byHead !== null) {
+      for (let i = 0; i < byHead.length; i++) {
+        chapters.push(byHead[i]);
+      }
+      ctx.hooks.onAction(`　　按文内标题切成 ${chapters.length} 章`);
+    } else {
+      for (let i = 0; i < pages.length; i++) {
+        const p = pages[i];
+        // 多页时每页一章，章名用页面标题；单页时章名就是书名
+        const name = pages.length > 1
+          ? (p.title.length > 0 ? p.title : `第 ${chapters.length + 1} 章`)
+          : workTitle;
+        chapters.push({ title: name, paragraphs: p.paragraphs });
+      }
     }
     const html = WebToBook.buildHtml(workTitle, chapters);
     const path = `${dir}/web_${Date.now()}.html`;
@@ -577,7 +601,7 @@ export class FinderTools {
     const meta: FicMeta = {
       title: workTitle,
       author: authorArg,
-      chapters: pages.length,
+      chapters: chapters.length,
       words: totalChars,
       info: urls.length > 1 ? `网页抓取 · ${pages.length}/${urls.length} 页` : '网页抓取',
       epubUrl: '',
@@ -588,7 +612,7 @@ export class FinderTools {
       st.hits.push(meta);
       st.downloaded.push(item);
       ctx.hooks.onHit(meta);
-      ctx.hooks.onAction(`📥 已抓成书：《${workTitle}》（待入库，${pages.length} 章）`);
+      ctx.hooks.onAction(`📥 已抓成书：《${workTitle}》（待入库，${chapters.length} 章）`);
       ctx.hooks.onDownloaded(item);
       const note = pages.length < urls.length
         ? `已放进待入库区（${urls.length - pages.length} 个页面抓取失败：${failedNotes.join('；')}）`
@@ -616,15 +640,27 @@ export class FinderTools {
     ctx.hooks.onAction(`🩺 体检：${url}`);
     const b = FinderTools.budget(st);
     const dir = `${ctx.ui.cacheDir}/finder_dl`;
-    const res = await HttpFetch.toFile(url, dir);
+    // 体检必须看「真正会被抓的那份页面」。不过镜像的话，/p/ 链接会报出
+    // 「贴吧小程序、可抽出 0 段」——一份和实际抓取结果相反的假报告，
+    // 模型据此会判定此路不通，然后自己去拼接口（上次就是这么偏的）。
+    const target = SiteMirror.url(url);
+    if (target !== url) {
+      ctx.hooks.onAction(`　　等效地址：${target}`);
+    }
+    const res = await HttpFetch.toFile(target, dir);
     if (!res.ok) {
+      // 403 时把响应体摸一眼：是反爬挑战页还是真登录墙，判断完全不同
+      const diag = await HttpFetch.getText(target, '');
+      const block = AntiBot.detect(diag.text);
+      const note = `${res.note}${block.length > 0 ? `（识别为拦截页：${AntiBot.hint(block)}）` : ''}`;
       const reply: DebugReply = {
         status: 'fail', http_status: 0, content_type: '', bytes: 0, title: '',
         visible_text_chars: 0, direct_extract: '', markers: [], data_outline: [],
-        rule_hit: '', preview: '', note: res.note,
+        rule_hit: '', preview: '', json_max_text: 0, note: note,
+        mirrored_from: target !== url ? target : '',
         steps_left: b.steps_left, hint: b.hint
       };
-      ctx.hooks.onAction(`　　体检失败：${res.note}`);
+      ctx.hooks.onAction(`　　体检失败：${note}`);
       return JSON.stringify(reply);
     }
     let text = '';
@@ -640,11 +676,8 @@ export class FinderTools {
       }
     }
     const root = HtmlParser.parse(text);
-    let title = '';
-    const titleNode = HtmlParser.findFirst(root, 'title');
-    if (titleNode !== null) {
-      title = XhtmlConverter.normalizeSpace(HtmlParser.textOf(titleNode));
-    }
+    // 标题走和 book 管线同一个函数：体检报的书名必须和真正入库的书名一致
+    const title = WebToBook.pageTitle(root);
     const visible = WebPage.toText(text);
     let paraCount = 0;
     let paraChars = 0;
@@ -665,6 +698,7 @@ export class FinderTools {
     }
     const markers = SiteRules.markersIn(text);
     const outline: string[] = [];
+    let jsonMaxText = 0;
     for (let i = 0; i < markers.length; i++) {
       const json = SiteRules.extractJsonAfter(text, markers[i]);
       if (json === null) {
@@ -673,12 +707,29 @@ export class FinderTools {
       try {
         const data = JSON.parse(json) as Object;
         SiteRules.outline(data, outline, 40);
+        jsonMaxText = SiteRules.maxStrLen(data, 0);
       } catch (e) {
         outline.push(`${markers[i]}：JSON 解析失败`);
       }
       break;
     }
-    const hit = SiteRules.extract(text, url);
+    const hit = SiteRules.extract(text, target);
+    const mirrorNote = target !== url
+      ? `这份报告抓的是等效地址 ${target}（原链接会被站方重定向到空壳页），html_to_book 抓同一个链接时用的也是它。`
+      : '';
+    let note = '';
+    if (markers.length > 0 && hit === null) {
+      // 有标记不等于正文在里面：B 站专栏这类站的 JSON 只有标题/封面，
+      // 正文是接口取的，写规则怎么写都抽不到 —— 用最长字符串长度区分开。
+      note = jsonMaxText >= 600
+        ? `页面内嵌了数据（最长字符串 ${jsonMaxText} 字，正文很可能就在里面）但规则未命中：按 data_outline 的路径用 manage_site_rules(add) 写规则`
+        : `内嵌数据里只有元信息（最长字符串 ${jsonMaxText} 字，不足正文）：真正文不在这份 JSON 里，属于接口取数的动态页 —— 别写站点规则，直接用 html_to_book / fetch_page 走内置渲染`;
+    } else if (markers.length === 0 && visible.length < 300) {
+      note = '可见文本极少且没有内嵌数据标记：这是 JS 动态渲染页，正文由接口异步塞进 DOM —— 走内置渲染（html_to_book / fetch_page 会自动降级），别写规则';
+    }
+    if (mirrorNote.length > 0) {
+      note = note.length > 0 ? `${mirrorNote}${note}` : mirrorNote;
+    }
     const reply: DebugReply = {
       status: 'ok',
       http_status: 200,
@@ -691,11 +742,9 @@ export class FinderTools {
       data_outline: outline,
       rule_hit: hit === null ? '' : `命中规则「${hit.rule.note}」：标题「${hit.title}」，${hit.paragraphs.length} 段`,
       preview: visible.length > 0 ? visible.substring(0, 300) : '',
-      note: markers.length > 0 && hit === null
-        ? '页面内嵌了数据但规则未命中：正文多半就在源码 JSON 里，可用 manage_site_rules(add) 按 data_outline 里的路径写规则'
-        : (visible.length < 300 && markers.length === 0
-          ? '可见文本极少：可能是 JS 动态渲染（数据在接口里），只能内置渲染抓，或需要登录。有把握的话可用 http_probe 试探该站的数据接口'
-          : ''),
+      json_max_text: jsonMaxText,
+      note: note,
+      mirrored_from: target !== url ? target : '',
       steps_left: b.steps_left,
       hint: b.hint
     };
@@ -716,8 +765,20 @@ export class FinderTools {
     };
     if (action === 'list') {
       const rules = SiteRules.allRules();
-      ctx.hooks.onAction(`📋 站点规则：共 ${rules.length} 条`);
-      return send('ok', rules.length === 0 ? '还没有任何规则' : '', rules);
+      const off = SiteRules.loadDisabled();
+      ctx.hooks.onAction(`📋 站点规则：共 ${rules.length} 条${off.length > 0 ? `（停用 ${off.length} 条）` : ''}`);
+      const note = rules.length === 0 ? '还没有任何规则'
+        : (off.length > 0 ? `已停用：${off.join('、')}（这些站现在走通用解析）` : '');
+      return send('ok', note, rules);
+    }
+    if (action === 'disable' || action === 'enable') {
+      const pattern = FinderTools.str(args, 'url_pattern');
+      if (pattern.length === 0) {
+        return send('bad_args', '缺少 url_pattern（要停用/恢复哪条规则）', SiteRules.allRules());
+      }
+      const why = SiteRules.setEnabled(pattern, action === 'enable');
+      ctx.hooks.onAction(`📐 站点规则：${why}`);
+      return send(why.indexOf('已') === 0 ? 'ok' : 'bad_args', why, SiteRules.allRules());
     }
     if (action === 'add') {
       const pattern = FinderTools.str(args, 'url_pattern');

@@ -1,6 +1,9 @@
 import { http } from '@kit.NetworkKit';
 import { HeadlessRenderer } from './HeadlessRenderer';
 import { WebToBook } from './WebToBook';
+import { AntiBot } from './AntiBot';
+import { SiteMirror } from './SiteMirror';
+import { MOBILE_UA } from './NetUa';
 import { Log } from '../common/Logger';
 
 /**
@@ -32,12 +35,15 @@ const SHELL_TEXT_CHARS: number = 300;
 
 export class WebPage {
   static async read(url: string, maxChars: number): Promise<PageResult> {
+    // 贴吧 /p/ 匿名访问只剩「小程序空壳」，换成 wap 版只看楼主页再抓
+    const target = SiteMirror.url(url);
+    const mirrored = target !== url;
     const req = http.createHttp();
     try {
       const header: Record<string, string> = {
         'Accept': 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8',
-        'User-Agent': 'Mozilla/5.0 (Linux; HarmonyOS) AppleWebKit/537.36 (KHTML, like Gecko) Mobile Safari/537.36'
+        'User-Agent': MOBILE_UA
       };
       const options: http.HttpRequestOptions = {
         method: http.RequestMethod.GET,
@@ -46,11 +52,18 @@ export class WebPage {
         connectTimeout: 12000,
         readTimeout: 20000
       };
-      const resp = await req.request(url, options);
+      const resp = await req.request(target, options);
+      const body = typeof resp.result === 'string' ? resp.result : '';
       if (resp.responseCode !== 200) {
+        // 403/429/503 有两种含义：真的没权限，或「裸请求过不去、真浏览器能过」的
+        // 反爬挑战页（知乎 __zse_ck、Cloudflare 校验）。后者只能靠内置渲染，
+        // 所以先别判死 —— 渲染器跑一次再决定。
+        if (WebPage.mayBeAntiBot(resp.responseCode)) {
+          return await WebPage.readByRender(target, resp.responseCode, body, maxChars);
+        }
         return { ok: false, status: resp.responseCode, title: '', text: '', truncated: false, note: `HTTP ${resp.responseCode}` };
       }
-      let html = typeof resp.result === 'string' ? resp.result : '';
+      let html = body;
       if (html.length === 0) {
         return { ok: false, status: resp.responseCode, title: '', text: '', truncated: false, note: '页面内容为空' };
       }
@@ -59,18 +72,18 @@ export class WebPage {
       }
       let title = WebPage.titleOf(html);
       let text = WebPage.toText(html);
-      let note = '';
+      let note = mirrored ? '已改用贴吧手机版只看楼主页（原链接会 302 到小程序空壳）' : '';
       if (text.length < SHELL_TEXT_CHARS) {
         // 空壳页（SPA）：正文要靠 JS 调接口插入，直接抓只有骨架。
         // 用隐藏 ArkWeb 真渲染一次再抽 —— 站内搜索结果页（晋江/LOFTER 标签页）都靠这条路。
-        const rendered = await HeadlessRenderer.render(url);
+        const rendered = await HeadlessRenderer.render(target);
         if (rendered.ok) {
           const renderedTitle = WebPage.titleOf(rendered.html);
           if (renderedTitle.length > 0) {
             title = renderedTitle;
           }
           text = WebPage.toText(rendered.html);
-          note = '已用内置浏览器渲染（页面为 JS 动态渲染）';
+          note = rendered.note.length > 0 ? rendered.note : '已用内置浏览器渲染（页面为 JS 动态渲染）';
           Log.i(`fetch_page 渲染降级成功：${url}`);
         } else {
           Log.w(`fetch_page 渲染降级失败：${rendered.note}`);
@@ -100,6 +113,44 @@ export class WebPage {
     } finally {
       req.destroy();
     }
+  }
+
+  /** 这些状态码可能只是「裸请求被拦」，值得让内置浏览器再试一次 */
+  private static mayBeAntiBot(status: number): boolean {
+    return status === 401 || status === 403 || status === 405 || status === 406 ||
+      status === 429 || status === 451 || status === 500 || status === 502 || status === 503;
+  }
+
+  /**
+   * 直抓被拦时的第二跳：交给内置渲染器（真浏览器）重试。
+   * 挑战页要靠 JS 写 Cookie 再 reload，只有浏览器能过；过不了才如实说明是哪堵墙。
+   */
+  private static async readByRender(url: string, status: number, body: string, maxChars: number): Promise<PageResult> {
+    const block = AntiBot.detect(body);
+    Log.i(`直抓 HTTP ${status}（${block.length > 0 ? block : '未识别拦截页'}），改用内置渲染：${url}`);
+    const rendered = await HeadlessRenderer.render(url);
+    if (rendered.ok) {
+      let text = WebPage.toText(rendered.html);
+      const title = WebPage.titleOf(rendered.html);
+      let truncated = false;
+      if (text.length > maxChars) {
+        text = text.substring(0, maxChars);
+        truncated = true;
+      }
+      if (text.length > 0) {
+        Log.i(`直抓被拦但渲染成功：${url}（正文约 ${text.length} 字符）`);
+        return {
+          ok: true, status: 200, title: title, text: text, truncated: truncated,
+          note: `直抓被拦（HTTP ${status}），${rendered.note.length > 0 ? rendered.note : '已用内置浏览器渲染后读取'}`
+        };
+      }
+    }
+    const why = rendered.ok ? '渲染后仍没有正文' : rendered.note;
+    Log.w(`直抓与渲染都没拿到正文：${url}（${why}）`);
+    return {
+      ok: false, status: status, title: '', text: '', truncated: false,
+      note: `HTTP ${status}${block.length > 0 ? `（${AntiBot.hint(block)}）` : ''}；内置渲染也没过：${why}`
+    };
   }
 
   private static titleOf(html: string): string {
