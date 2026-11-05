@@ -1,6 +1,7 @@
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { http } from '@kit.NetworkKit';
 import { Log } from '../common/Logger';
+import { MOBILE_UA } from './NetUa';
 
 export interface FetchFileResult {
   ok: boolean;
@@ -13,7 +14,7 @@ export interface FetchFileResult {
 /** 单文件下载上限，超过直接拒绝（同人文 EPUB 通常几 MB） */
 const MAX_DOWNLOAD_BYTES: number = 60 * 1024 * 1024;
 
-const UA: string = 'Mozilla/5.0 (Linux; HarmonyOS) AppleWebKit/537.36 (KHTML, like Gecko) Mobile Safari/537.36';
+const UA: string = MOBILE_UA;
 
 /** getText / postForm / request 的返回 */
 export interface FetchTextResult {

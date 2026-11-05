@@ -119,14 +119,21 @@ export class XhtmlConverter {
           if (runs.length === 0) {
             continue;
           }
-          const text = XhtmlConverter.normalizeSpace(runsToPlainText(runs));
-          if (DIVIDER_RE.test(text) && text.length <= 40) {
-            XhtmlConverter.pushDivider(out);
-          } else {
+          // 老式页面用 <br><br> 当段落分隔（晋江整章都在一个 div 里，130 个 <br>），
+          // 只把 <br> 变成换行符会把整章压成一段：译文成一大块、阅读视图也不分段。
+          // 这里按换行切开，每段独立成段。
+          const groups = XhtmlConverter.splitByBreak(runs);
+          for (let g = 0; g < groups.length; g++) {
+            const grp = groups[g];
+            const text = XhtmlConverter.normalizeSpace(runsToPlainText(grp));
             if (text.length === 0) {
               continue;
             }
-            const bp: ParsedParagraph = { type: ParaType.TEXT, runs: runs };
+            if (DIVIDER_RE.test(text) && text.length <= 40) {
+              XhtmlConverter.pushDivider(out);
+              continue;
+            }
+            const bp: ParsedParagraph = { type: ParaType.TEXT, runs: grp };
             out.push(bp);
           }
         }
@@ -152,6 +159,35 @@ export class XhtmlConverter {
       }
     }
     return false;
+  }
+
+  /**
+   * 按 <br> 产生的换行把 Run[] 切成多组，每组一段。
+   * 样式随片段带走，切段不丢加粗/斜体。
+   */
+  private static splitByBreak(runs: Run[]): Run[][] {
+    const groups: Run[][] = [];
+    let cur: Run[] = [];
+    for (let i = 0; i < runs.length; i++) {
+      const r = runs[i];
+      const segs = r.text.split('\n');
+      for (let s = 0; s < segs.length; s++) {
+        if (s > 0) {
+          groups.push(cur);
+          cur = [];
+        }
+        if (segs[s].length === 0) {
+          continue;
+        }
+        const nr: Run = {
+          text: segs[s], bold: r.bold, italic: r.italic,
+          underline: r.underline, strike: r.strike
+        };
+        cur.push(nr);
+      }
+    }
+    groups.push(cur);
+    return groups;
   }
 
   /** 把一个块内的行内内容拍平成 Run[] */

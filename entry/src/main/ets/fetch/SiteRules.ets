@@ -16,6 +16,8 @@ import { ParaType } from '../model/Models';
  * 规则两种形态（可并存，JSON 优先）：
  * - 内嵌数据：marker 定位 JSON 起点，json_title / json_content 是点分路径；
  * - 元素定位：selector 定位正文容器（形如 tag.class / .class / #id / tag）。
+ *   加 all: 前缀（如 all:div.content）收集全部匹配容器并按文档顺序拼接，
+ *   用于贴吧这类每层楼正文各占一个容器的页面。
  *
  * 内置规则不可删除，用户规则可增删、按 urlPattern 覆盖。
  */
@@ -43,7 +45,7 @@ export interface SiteRuleHit {
   paragraphs: ParsedParagraph[];
 }
 
-/** 内置规则：LOFTER 帖子详情页 */
+/** 内置规则 */
 const BUILTIN_RULES: SiteRule[] = [
   {
     urlPattern: 'lofter.com/post', marker: '__initialize_data__',
@@ -51,6 +53,49 @@ const BUILTIN_RULES: SiteRule[] = [
     jsonContent: 'postData.data.postData.postView.textPostView.content',
     selector: '', titleFromFirstParagraph: true,
     note: 'LOFTER 帖子（内嵌数据）', builtin: true
+  },
+  {
+    // 晋江整章都塞在一个 div 里，用 <br><br> 分段；body 里其余全是导航、
+    // 作者推文、打赏面板、长评和页脚。真机导出的一章 238 段里只有 1 段是正文。
+    urlPattern: 'jjwxc.net/onebook.php', marker: '',
+    jsonTitle: '', jsonContent: '',
+    selector: '#paragraph_comment_content', titleFromFirstParagraph: false,
+    note: '晋江章节页（正文容器）', builtin: true
+  },
+  {
+    // B 站专栏正文在 .opus-module-content 里；容器外是「关注」「下载 App」、
+    // 标签和「热门评论」，这些以前会跟着正文一起进书。
+    // 注意：/read/cv{id} 现在常 302 到 /read/mobile 的 JS 壳，那时这条规则抽不到，
+    // 该走下面的接口规则。
+    urlPattern: 'bilibili.com/read/', marker: '',
+    jsonTitle: '', jsonContent: '',
+    selector: 'div.opus-module-content', titleFromFirstParagraph: false,
+    note: 'B站专栏（正文容器）', builtin: true
+  },
+  {
+    // 真机验证过：模型自己用 http_probe 探通了这个接口（HTTP 200，data.content 全文），
+    // 但它当时是手写规则才用上的。直接内置成接口规则，html_to_book 拿到接口地址就能取正文。
+    // 接口偶发 -509 限流，那时 JSON 里没有 data.content，会按「接口里没取到正文」报失败。
+    urlPattern: 'api.bilibili.com/x/article/view', marker: '"data":',
+    jsonTitle: 'data.title', jsonContent: 'data.content',
+    selector: '', titleFromFirstParagraph: false,
+    note: 'B站专栏接口（JSON）', builtin: true
+  },
+  {
+    // 贴吧帖子（触屏版）：每层楼的正文在独立的 div.content 里，作者/时间/
+    // 「操作/收藏 回复 举报」按钮和楼中楼都在容器外，所以单靠通用清洗总会
+    // 混进楼层壳 —— 必须用 all: 前缀收集全部楼层容器（真机 wap 页 30 层验证无泄漏）。
+    // /p/ 直抓常被百度安全验证拦，wap 版 /mo/m?kz={帖子id} 免验证，两版模板相同。
+    urlPattern: 'tieba.baidu.com', marker: '', jsonTitle: '', jsonContent: '',
+    selector: 'all:div.content', titleFromFirstParagraph: false,
+    note: '百度贴吧帖子（每层楼一个容器）', builtin: true
+  },
+  {
+    // 贴吧还有一套桌面/触屏老模板，楼层正文容器叫 d_post_content
+    // （class 里常带 j_d_post_content）。抽不到就换这条，见 extract 的逐条试逻辑。
+    urlPattern: 'tieba.baidu.com', marker: '', jsonTitle: '', jsonContent: '',
+    selector: 'all:div.d_post_content', titleFromFirstParagraph: false,
+    note: '百度贴吧帖子（d_post_content 容器）', builtin: true
   }
 ];
 
@@ -101,6 +146,81 @@ export class SiteRules {
     }
   }
 
+  /* ---------- 临时停用 ---------- */
+
+  /**
+   * 被临时停用的 urlPattern 清单（单独存一个文件，不动规则本体）。
+   *
+   * 存在的理由：内置规则会让我们看不到「模型自己能不能解决」——
+   * 想验证自愈能力（debug_fetch → 写规则 → 验证）或排查某条规则是不是
+   * 唯一依赖时，必须先把它停掉，事后再恢复。删掉内置规则做不到这件事
+   * （内置规则不可删除），所以单独记一份停用名单。
+   */
+  private static disabledPath(): string {
+    return `${SiteRules.dir}/site_rules_off.json`;
+  }
+
+  static loadDisabled(): string[] {
+    if (SiteRules.dir.length === 0) {
+      return [];
+    }
+    try {
+      const raw = fs.readTextSync(SiteRules.disabledPath());
+      const parsed = JSON.parse(raw) as string[];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  private static saveDisabled(list: string[]): boolean {
+    try {
+      const file = fs.openSync(SiteRules.disabledPath(),
+        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        fs.writeSync(file.fd, JSON.stringify(list));
+      } finally {
+        fs.closeSync(file);
+      }
+      return true;
+    } catch (e) {
+      Log.w(`停用名单保存失败：${(e as Error).message}`);
+      return false;
+    }
+  }
+
+  static isDisabled(urlPattern: string): boolean {
+    return SiteRules.loadDisabled().indexOf(urlPattern) >= 0;
+  }
+
+  /** 停用 / 恢复某条规则，返回给模型的提示 */
+  static setEnabled(urlPattern: string, enabled: boolean): string {
+    const exists = SiteRules.allRules().filter((r): boolean => r.urlPattern === urlPattern).length > 0;
+    if (!exists) {
+      return `没有 url_pattern 为「${urlPattern}」的规则，先用 action=list 看一下现有规则`;
+    }
+    const off = SiteRules.loadDisabled();
+    const at = off.indexOf(urlPattern);
+    if (enabled) {
+      if (at < 0) {
+        return `规则「${urlPattern}」本来就是启用状态`;
+      }
+      off.splice(at, 1);
+      if (!SiteRules.saveDisabled(off)) {
+        return '停用名单保存失败（写文件出错）';
+      }
+      return `已恢复规则「${urlPattern}」，下次抓取立即生效`;
+    }
+    if (at >= 0) {
+      return `规则「${urlPattern}」已经是停用状态`;
+    }
+    off.push(urlPattern);
+    if (!SiteRules.saveDisabled(off)) {
+      return '停用名单保存失败（写文件出错）';
+    }
+    return `已停用规则「${urlPattern}」：这个站接下来会走通用解析（直抓 → 渲染），内置规则不再替它兜底`;
+  }
+
   static allRules(): SiteRule[] {
     // 用户规则在前：同 urlPattern 时用户改过的优先于内置
     return SiteRules.loadUserRules().concat(BUILTIN_RULES);
@@ -111,25 +231,50 @@ export class SiteRules {
       return null;
     }
     const rules = SiteRules.allRules();
+    const off = SiteRules.loadDisabled();
     for (let i = 0; i < rules.length; i++) {
-      if (url.indexOf(rules[i].urlPattern) >= 0) {
+      if (url.indexOf(rules[i].urlPattern) >= 0 && off.indexOf(rules[i].urlPattern) < 0) {
         return rules[i];
       }
     }
     return null;
   }
 
+  /** 所有匹配的启用规则（用户规则优先）。同一个站的不同模板各写一条，
+   *  抽取时按顺序试，能兼容「同一站有多个页面模板」的情况。 */
+  static matchAll(url: string): SiteRule[] {
+    const out: SiteRule[] = [];
+    if (url.length === 0) {
+      return out;
+    }
+    const rules = SiteRules.allRules();
+    const off = SiteRules.loadDisabled();
+    for (let i = 0; i < rules.length; i++) {
+      if (url.indexOf(rules[i].urlPattern) >= 0 && off.indexOf(rules[i].urlPattern) < 0) {
+        out.push(rules[i]);
+      }
+    }
+    return out;
+  }
+
   /** 按规则从页面源码抽标题 + 正文段落；抽不到返回 null */
   static extract(text: string, url: string): SiteRuleHit | null {
-    const rule = SiteRules.match(url);
-    if (rule === null) {
-      return null;
+    // 逐个试，而不是只试第一条：同站多模板时（如贴吧 wap 版和触屏版
+    // 正文容器不同），第一条不命中要让后面的规则有机会兜住。
+    const rules = SiteRules.matchAll(url);
+    for (let i = 0; i < rules.length; i++) {
+      const hit = SiteRules.extractWithRule(text, rules[i]);
+      if (hit !== null) {
+        return hit;
+      }
     }
-    return SiteRules.extractWithRule(text, rule);
+    return null;
   }
 
   static extractWithRule(text: string, rule: SiteRule): SiteRuleHit | null {
-    if (rule.marker.length > 0 && rule.jsonContent.length > 0) {
+    // jsonContent 有值就试 JSON 抽取：接口响应靠整份解析，页面靠 marker 定位，
+    // 两种情况都走 fromEmbeddedJson（里面按顺序试两个根对象）。
+    if (rule.jsonContent.length > 0) {
       const hit = SiteRules.fromEmbeddedJson(text, rule);
       if (hit !== null) {
         return hit;
@@ -144,18 +289,44 @@ export class SiteRules {
     return null;
   }
 
+  /**
+   * 从两种来源里取 JSON 根对象，按顺序试：
+   * ① 整个响应本身就是 JSON（站点接口返回，如 api.bilibili.com/x/article/view）——
+   *    这时路径是相对顶层写的（data.content），不能按 marker 截断，否则会从
+   *    data 子对象开始解析，data.content 反而找不到；
+   * ② 页面源码里内嵌的 JSON（LOFTER 那类，按 marker 定位起点）。
+   */
   private static fromEmbeddedJson(text: string, rule: SiteRule): SiteRuleHit | null {
-    const json = SiteRules.extractJsonAfter(text, rule.marker);
-    if (json === null) {
-      return null;
+    const roots: Object[] = [];
+    const trimmed = text.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        roots.push(JSON.parse(trimmed) as Object);
+      } catch (e) {
+        Log.w(`站点规则 ${rule.urlPattern}：响应声明是 JSON 但解析失败`);
+      }
     }
-    let data: Object;
-    try {
-      data = JSON.parse(json) as Object;
-    } catch (e) {
-      Log.w(`站点规则 ${rule.urlPattern}：内嵌 JSON 解析失败`);
-      return null;
+    if (rule.marker.length > 0) {
+      const json = SiteRules.extractJsonAfter(text, rule.marker);
+      if (json !== null) {
+        try {
+          roots.push(JSON.parse(json) as Object);
+        } catch (e) {
+          Log.w(`站点规则 ${rule.urlPattern}：内嵌 JSON 解析失败`);
+        }
+      }
     }
+    for (let i = 0; i < roots.length; i++) {
+      const hit = SiteRules.hitFromRoot(roots[i], rule);
+      if (hit !== null) {
+        return hit;
+      }
+    }
+    return null;
+  }
+
+  /** 按规则里的点分路径从某个 JSON 根对象里抽标题 + 正文 */
+  private static hitFromRoot(data: Object, rule: SiteRule): SiteRuleHit | null {
     let title = '';
     if (rule.jsonTitle.length > 0) {
       const t = SiteRules.getPath(data, rule.jsonTitle);
@@ -179,35 +350,46 @@ export class SiteRules {
 
   private static fromSelector(text: string, rule: SiteRule): SiteRuleHit | null {
     const root = HtmlParser.parse(text);
-    const node = SiteRules.querySelector(root, rule.selector);
-    if (node === null) {
+    const nodes = SiteRules.querySelectorAll(root, rule.selector);
+    if (nodes.length === 0) {
       return null;
     }
-    const paragraphs = XhtmlConverter.toParagraphs(node);
+    // 多容器（all: 前缀）按文档顺序拼接：贴吧这类每层楼一个容器的页面，
+    // 单容器选择器只能拿到第一层楼。
+    let paragraphs: ParsedParagraph[] = [];
+    for (let i = 0; i < nodes.length; i++) {
+      paragraphs = paragraphs.concat(XhtmlConverter.toParagraphs(nodes[i]));
+    }
     if (paragraphs.length === 0) {
       return null;
     }
-    let title = XhtmlConverter.firstHeadingText(node);
+    let title = XhtmlConverter.firstHeadingText(nodes[0]);
     if (title.length === 0 && rule.titleFromFirstParagraph) {
       title = SiteRules.firstText(paragraphs[0]).trim().substring(0, 40);
     }
-    Log.i(`站点规则命中「${rule.note}」（selector）：${title.length > 0 ? title : '（无标题）'}`);
+    Log.i(`站点规则命中「${rule.note}」（selector，${nodes.length} 个容器）：${title.length > 0 ? title : '（无标题）'}`);
     return { rule: rule, title: title, paragraphs: paragraphs };
   }
 
   /**
    * 极简选择器：tag.class / .class / #id / tag#id / tag。
-   * 自研 HTML 解析器没有 DOM API，这里按选择器语义在树上找第一个匹配节点。
+   * 加 all: 前缀（如 all:div.content）收集全部匹配节点（文档顺序），
+   * 否则只返回第一个匹配。自研 HTML 解析器没有 DOM API，这里按选择器语义在树上找。
    */
-  private static querySelector(root: HtmlNode, selector: string): HtmlNode | null {
+  private static querySelectorAll(root: HtmlNode, selector: string): HtmlNode[] {
+    const out: HtmlNode[] = [];
     const sel = selector.trim();
     if (sel.length === 0) {
-      return null;
+      return out;
+    }
+    let body = sel;
+    if (body.startsWith('all:')) {
+      body = body.substring(4).trim();
     }
     let tag = '';
     let cls = '';
     let id = '';
-    const parts = sel.split('.');
+    const parts = body.split('.');
     const head = parts[0];
     const idHash = head.indexOf('#');
     if (idHash >= 0) {
@@ -219,10 +401,10 @@ export class SiteRules {
     if (parts.length > 1) {
       cls = parts[1].trim();
     }
-    const out: HtmlNode[] = [];
-    SiteRules.walkElements(root, out);
-    for (let i = 0; i < out.length; i++) {
-      const n = out[i];
+    const walk: HtmlNode[] = [];
+    SiteRules.walkElements(root, walk);
+    for (let i = 0; i < walk.length; i++) {
+      const n = walk[i];
       if (tag.length > 0 && n.tag !== tag) {
         continue;
       }
@@ -232,9 +414,12 @@ export class SiteRules {
       if (cls.length > 0 && n.attr('class').split(/\s+/).indexOf(cls) < 0) {
         continue;
       }
-      return n;
+      out.push(n);
+      if (!sel.startsWith('all:')) {
+        break;
+      }
     }
-    return null;
+    return out;
   }
 
   /** 深度优先收集所有元素节点（含 root 自身） */
@@ -401,6 +586,58 @@ export class SiteRules {
       }
     }
     return found;
+  }
+
+  /**
+   * 内嵌 JSON 里最长的字符串长度。
+   *
+   * 用来区分两种「有标记但抽不到正文」：
+   * - 标记里确实藏着正文（LOFTER 型，几万字）→ 值得写规则；
+   * - 标记里只有标题、封面这类元信息（B 站专栏型，几十字）→ 正文是接口取的
+   *   真 CSR，写规则怎么写都没用，只能走渲染。这个数字能让模型一次看明白。
+   */
+  static maxStrLen(obj: Object, depth: number): number {
+    if (depth > 6) {
+      return 0;
+    }
+    if (typeof obj === 'string') {
+      return (obj as string).length;
+    }
+    let best = 0;
+    if (Array.isArray(obj)) {
+      const arr = obj as Object[];
+      for (let i = 0; i < arr.length && i < 40; i++) {
+        const n = SiteRules.maxStrLen(arr[i] as Object, depth + 1);
+        if (n > best) {
+          best = n;
+        }
+      }
+      return best;
+    }
+    if (typeof obj === 'object' && obj !== null) {
+      let keys: string[] = [];
+      try {
+        keys = Object.keys(obj as Record<string, Object>);
+      } catch (e) {
+        return 0;
+      }
+      for (let i = 0; i < keys.length && i < 60; i++) {
+        let v: Object | null = null;
+        try {
+          v = (obj as Record<string, Object>)[keys[i]] as Object;
+        } catch (e) {
+          continue;
+        }
+        if (v === null || v === undefined) {
+          continue;
+        }
+        const n = SiteRules.maxStrLen(v, depth + 1);
+        if (n > best) {
+          best = n;
+        }
+      }
+    }
+    return best;
   }
 
   /** 新增或覆盖一条用户规则（按 urlPattern 去重），返回给模型的提示 */

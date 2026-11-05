@@ -78,8 +78,25 @@ struct SearchPage {
     HeadlessRenderer.setHost({
       requestMount: (): void => {
         this.showRendererWeb = true;
+      },
+      remount: (): void => {
+        // 旧 controller 已和 Web 组件脱钩：把隐藏组件卸掉再挂一个新的。
+        // 中间隔一帧，否则属性没变化 ArkUI 不会重建节点。
+        this.showRendererWeb = false;
+        setTimeout((): void => {
+          this.showRendererWeb = true;
+        }, 50);
       }
     });
+  }
+
+  /**
+   * 页面销毁时通知渲染器：静态 ctrl 必须清空。
+   * 否则页面重建后仍指向上一页那个已卸载组件的 controller，
+   * loadUrl 会抛「must be associated with a Web component」。
+   */
+  aboutToDisappear(): void {
+    HeadlessRenderer.detachController(this.renderCtrl);
   }
 
   /** 系统分享进来时预填链接，用户确认后自己发出去 */

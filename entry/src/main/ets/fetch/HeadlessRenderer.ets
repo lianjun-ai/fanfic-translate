@@ -1,4 +1,6 @@
 import { webview } from '@kit.ArkWeb';
+import { MOBILE_UA } from './NetUa';
+import { AntiBot } from './AntiBot';
 import { Log } from '../common/Logger';
 
 /** 渲染结果：成功时 html 是渲染完成后的完整文档 */
@@ -11,6 +13,8 @@ export interface RenderResult {
 /** 渲染器宿主（SearchPage）：负责按需挂载隐藏的 Web 组件 */
 export interface RendererHost {
   requestMount: () => void;
+  /** 重建隐藏 Web 组件（旧 controller 已和组件脱钩时用）：先卸载再挂一个新的 */
+  remount: () => void;
 }
 
 /** 轮询参数 */
@@ -21,6 +25,12 @@ const STABLE_COUNT: number = 3;
 const GRACE_MS: number = 2000;
 /** 从 loadUrl 开始的总超时，超时也抽取（抽到多少算多少） */
 const TOTAL_TIMEOUT_MS: number = 20000;
+/** 撞上反爬挑战页时的放宽超时：脚本要跑、要写 Cookie、要自动重载，一次 20 秒不够 */
+const CHALLENGE_TIMEOUT_MS: number = 35000;
+/** 挑战页上如果一直不自动重载，到这个时间点主动刷一次（只刷一次） */
+const CHALLENGE_REFRESH_MS: number = 9000;
+/** 刷过一次还是挑战页，到此就认输（不等满 35 秒：脚本进了死循环，再等也不会变） */
+const CHALLENGE_GIVEUP_MS: number = 18000;
 /** 等宿主挂载 Web 组件的超时 */
 const MOUNT_TIMEOUT_MS: number = 6000;
 
@@ -49,6 +59,14 @@ export class HeadlessRenderer {
   private static pageEndWaiter: (() => void) | null = null;
   /** 串行队列尾部 */
   private static tail: Promise<void> = Promise.resolve();
+  /**
+   * 本次运行里「渲染过、被站点校验页拦住」的 URL。
+   *
+   * 记下来的理由：拦不拦是站点对这套环境的判定，同一个 URL 重试不会变。
+   * 真机上模型对知乎那条链接连试了三次渲染，每次都白等十几秒 —— 第二次
+   * 直接返回上次的结论，模型的步数和用户的时间都省下来。
+   */
+  private static blocked: Map<string, string> = new Map<string, string>();
 
   /** SearchPage 在 aboutToAppear 里注册宿主 */
   static setHost(host: RendererHost): void {
@@ -58,12 +76,36 @@ export class HeadlessRenderer {
   /** SearchPage 的 Web 组件 onControllerAttached 时调用 */
   static attachController(ctrl: webview.WebviewController): void {
     HeadlessRenderer.ctrl = ctrl;
+    // ArkWeb 默认 UA 带 ArkWeb/OpenHarmony 字样，知乎、小红书这类风控站会
+    // 直接判成爬虫返回 403（真机实测：直抓/探接口/渲染三条路全 403）。
+    // 伪装成常规 Android Chrome 移动端，让渲染降级在这些站上真正可用。
+    try {
+      ctrl.setCustomUserAgent(MOBILE_UA);
+    } catch (e) {
+      Log.w(`设置自定义 UA 失败（用默认 UA 继续）：${(e as Error).message}`);
+    }
     const waiter = HeadlessRenderer.attachWaiter;
     HeadlessRenderer.attachWaiter = null;
     if (waiter !== null) {
       waiter();
     }
     Log.i('内置渲染器 Web 组件已就绪');
+  }
+
+  /**
+   * SearchPage 销毁时调用，把静态引用清掉。
+   *
+   * 不清会踩一个必现的坑：页面重建后新的 SearchPage 有自己的 controller，
+   * 但静态 ctrl 还是上一页那个已卸载组件的 —— ensureMounted 看 ctrl 非空就
+   * 直接放行，loadUrl 抛「WebviewController must be associated with a
+   * Web component」（真机 B1 知乎那条就是这么挂的）。
+   */
+  static detachController(ctrl: webview.WebviewController): void {
+    if (HeadlessRenderer.ctrl === ctrl) {
+      HeadlessRenderer.ctrl = null;
+      HeadlessRenderer.attachWaiter = null;
+      Log.w('内置渲染器宿主已销毁，controller 置空');
+    }
   }
 
   /**
@@ -92,12 +134,17 @@ export class HeadlessRenderer {
   }
 
   private static async doRender(url: string): Promise<RenderResult> {
+    const known = HeadlessRenderer.blocked.get(url);
+    if (known !== undefined) {
+      Log.i(`内置渲染跳过（该链接本次已被拦过）：${url}`);
+      return { ok: false, html: '', note: `${known}；同一链接本次已渲染过，不再重复尝试` };
+    }
     // 1. 确保宿主已挂载 Web 组件、controller 可用
     const ready = await HeadlessRenderer.ensureMounted();
     if (!ready) {
       return { ok: false, html: '', note: '内置渲染器未能启动' };
     }
-    const ctrl = HeadlessRenderer.ctrl;
+    let ctrl = HeadlessRenderer.ctrl;
     if (ctrl === null) {
       return { ok: false, html: '', note: '内置渲染器未能启动' };
     }
@@ -110,7 +157,22 @@ export class HeadlessRenderer {
     try {
       ctrl.loadUrl(url);
     } catch (e) {
-      return { ok: false, html: '', note: `内置渲染加载失败：${(e as Error).message}` };
+      const msg = (e as Error).message;
+      Log.w(`内置渲染加载失败：${msg}`);
+      if (msg.indexOf('associated') < 0) {
+        return { ok: false, html: '', note: `内置渲染加载失败：${msg}` };
+      }
+      // controller 和 Web 组件脱钩（宿主页面重建过）：重建组件，重取 controller 再试一次
+      const fresh = await HeadlessRenderer.remount();
+      if (fresh === null) {
+        return { ok: false, html: '', note: '内置渲染器未能启动（宿主页面已重建，重新挂载失败）' };
+      }
+      ctrl = fresh;
+      try {
+        ctrl.loadUrl(url);
+      } catch (e2) {
+        return { ok: false, html: '', note: `内置渲染加载失败：${(e2 as Error).message}` };
+      }
     }
     const startedAt = Date.now();
     await HeadlessRenderer.withDeadline(pageEndPromise, 12000);
@@ -125,21 +187,59 @@ export class HeadlessRenderer {
     if (elapsed < GRACE_MS) {
       await HeadlessRenderer.sleep(GRACE_MS - elapsed);
     }
-    const lengthScript = 'document.body ? String(document.body.innerText.length) : "0"';
     let last = -1;
     let stable = 0;
-    while (Date.now() - startedAt < TOTAL_TIMEOUT_MS) {
+    let challenged = false;
+    let refreshed = false;
+    let hitTimeout = false;
+    while (true) {
+      // 撞上挑战页就换成更长的总超时：它要靠 JS 写 Cookie + reload 才能过
+      const limit = challenged ? CHALLENGE_TIMEOUT_MS : TOTAL_TIMEOUT_MS;
+      if (Date.now() - startedAt >= limit) {
+        hitTimeout = true;
+        break;
+      }
       let reading = -1;
+      let chal = false;
       try {
-        const raw = await ctrl.runJavaScript(lengthScript);
-        reading = parseInt(HeadlessRenderer.unwrap(raw), 10);
-        if (isNaN(reading)) {
-          reading = -1;
-        }
+        const raw = await ctrl.runJavaScript(HeadlessRenderer.STATE_SCRIPT);
+        const obj = JSON.parse(HeadlessRenderer.unwrap(raw)) as Record<string, Object>;
+        const n = obj['n'];
+        reading = typeof n === 'number' ? n as number : -1;
+        chal = obj['c'] === 1;
       } catch (e) {
         Log.w(`内置渲染轮询失败：${(e as Error).message}`);
       }
-      if (reading >= 0 && reading === last) {
+      if (chal) {
+        // 挑战页：不判稳（正文还没来），等脚本重载或主动刷一次
+        if (!challenged) {
+          challenged = true;
+          Log.i('内置渲染：命中反爬挑战页，等脚本执行后重载（最长 35 秒）');
+        }
+        stable = 0;
+        if (!refreshed && Date.now() - startedAt > CHALLENGE_REFRESH_MS) {
+          refreshed = true;
+          try {
+            ctrl.refresh();
+            Log.i('内置渲染：挑战页未自动重载，主动刷新一次');
+          } catch (e) {
+            Log.w(`挑战页刷新失败：${(e as Error).message}`);
+          }
+        }
+        // 刷过一次还是挑战页：说明脚本判定了环境可疑，再等也不会放行
+        if (refreshed && Date.now() - startedAt > CHALLENGE_GIVEUP_MS) {
+          Log.w('内置渲染：刷新后仍是挑战页，提前收手');
+          break;
+        }
+        last = reading;
+        await HeadlessRenderer.sleep(POLL_INTERVAL_MS);
+        continue;
+      }
+      // 容差判稳：轮播图、弹幕数、计时器会让正文长度一直小幅抖动，
+      // 严格相等就永远判不稳，只能等满总超时（真机上 B站 就是这样被报成「渲染超时」）
+      const same = reading >= 0 && last >= 0 &&
+        Math.abs(reading - last) <= Math.max(2, Math.round(last * 0.01));
+      if (same) {
         stable++;
         if (stable >= STABLE_COUNT - 1) {
           break;
@@ -167,9 +267,36 @@ export class HeadlessRenderer {
     if (html.length === 0) {
       return { ok: false, html: '', note: '内置渲染后仍抽取不到内容' };
     }
-    Log.i(`内置渲染完成：${url}（HTML ${html.length} 字符，正文文本约 ${Math.max(last, 0)} 字符）`);
-    return { ok: true, html: html, note: '' };
+    const took = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    // 把「等满了超时」和「正常判稳」区分开写进 note：调用方（模型/用户）不必靠猜，
+    // 也不会把一次成功的降级说成失败。
+    const prefix = hitTimeout
+      ? `内置浏览器渲染超时（等满 ${took} 秒仍未判稳，抽取了当时的内容）；`
+      : `已用内置浏览器渲染（${took} 秒）；`;
+    // 渲染完还是挑战页 = 这次真过不去（脚本被拦、或站点认定环境可疑）。
+    // 说清楚是哪堵墙，调用方才能给用户正确建议，而不是含糊一句「抓不到」。
+    const block = AntiBot.detectRendered(html, last > 0 ? last : 0);
+    if (block.length > 0) {
+      const why = `内置浏览器渲染 ${took} 秒后仍停在站点校验页：${AntiBot.hint(block)}`;
+      HeadlessRenderer.blocked.set(url, why);
+      Log.w(`内置渲染仍是拦截页（${block}）：${url}`);
+      return { ok: false, html: html, note: why };
+    }
+    Log.i(`内置渲染完成：${url}（HTML ${html.length} 字符，正文文本约 ${Math.max(last, 0)} 字符，${took} 秒${hitTimeout ? '，超时' : ''}）`);
+    return { ok: true, html: html, note: prefix };
   }
+
+  /**
+   * 轮询脚本：一次返回「正文文本长度」和「是否停在反爬挑战页」。
+   * 挑战页判定只用 querySelector 看几个固定节点（不读整页 innerHTML，
+   * 每 500ms 跑一次，读大页会明显拖慢渲染）。
+   */
+  private static readonly STATE_SCRIPT: string =
+    '(function(){var b=document.body;var t=document.title||"";var c=0;' +
+      'if(document.querySelector("meta#zh-zse-ck")){c=1;}' +
+      'else if(t.indexOf("Just a moment")>=0){c=1;}' +
+      'else if(document.querySelector("#challenge-form,#challenge-running,.cf-browser-verification")){c=1;}' +
+      'return JSON.stringify({n:b?b.innerText.length:0,c:c});})()';
 
   /**
    * ArkWeb runJavaScript 返回的是结果的 JSON 序列化形式：
@@ -207,6 +334,26 @@ export class HeadlessRenderer {
     const ok = HeadlessRenderer.ctrl !== null;
     HeadlessRenderer.attachWaiter = null;
     return ok;
+  }
+
+  /**
+   * 让宿主重建 Web 组件并等新的 controller 就绪。
+   * 只用于「ctrl 存在但已和组件脱钩」的补救；正常情况下 detachController 已经把
+   * 引用清空了，走 ensureMounted 即可。
+   */
+  private static async remount(): Promise<webview.WebviewController | null> {
+    const host = HeadlessRenderer.host;
+    if (host === null) {
+      return null;
+    }
+    HeadlessRenderer.ctrl = null;
+    const attached = new Promise<void>((resolve) => {
+      HeadlessRenderer.attachWaiter = resolve;
+    });
+    host.remount();
+    await HeadlessRenderer.withDeadline(attached, MOUNT_TIMEOUT_MS + 2000);
+    HeadlessRenderer.attachWaiter = null;
+    return HeadlessRenderer.ctrl;
   }
 
   /** 带超时等待：到点就继续，不等了（Promise 结果被丢弃） */
