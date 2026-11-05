@@ -7,6 +7,7 @@ import { ChapterDao } from '../data/ChapterDao';
 import { Exporter } from '../export/Exporter';
 import { ExportDialog } from './ExportDialog';
 import { Log } from '../common/Logger';
+import { PENDING_SHARE_KEY } from '../entryability/EntryAbility';
 
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : `${n}`;
@@ -147,6 +148,13 @@ struct Bookshelf {
   /** 每本书「第一章梗概」：workId → 「章节名：梗概」，翻译过的书才有 */
   @State briefs: Record<string, string> = {};
 
+  /**
+   * 分享进来的待跳转链接。key 与 EntryAbility.PENDING_SHARE_KEY 一致。
+   * 用 @StorageLink 而不是轮询：冷启动时「取分享链接」是异步 IPC，
+   * 值可能在书架页 onPageShow 之后才到——只有响应式才能接住晚到的值。
+   */
+  @StorageLink('pendingSharedUrl') @Watch('onSharedUrlChanged') pendingSharedUrl: string = '';
+
   private exportDialog: CustomDialogController = new CustomDialogController({
     builder: ExportDialog({
       onlyBook: true,
@@ -178,6 +186,43 @@ struct Bookshelf {
 
   onPageShow(): void {
     this.reload();
+    this.consumeSharedUrl();
+  }
+
+  /**
+   * 消费分享链接：Ability 里 pushUrl 常常早于页面栈就绪（冷启动时静默失败），
+   * 所以链接先落进 AppStorage，这里等页面真正显示出来再跳，栈一定就绪。
+   */
+  private consumeSharedUrl(): void {
+    const pending = AppStorage.get<string>(PENDING_SHARE_KEY);
+    if (pending === undefined || pending === null || pending.length === 0) {
+      return;
+    }
+    this.pendingSharedUrl = '';
+    this.gotoSearchWith(pending);
+  }
+
+  /** @StorageLink 的监听：链接晚于页面显示才到时，由这里接手跳转 */
+  private onSharedUrlChanged(): void {
+    const url = this.pendingSharedUrl;
+    if (url === undefined || url === null || url.length === 0) {
+      return;
+    }
+    this.pendingSharedUrl = '';
+    this.gotoSearchWith(url);
+  }
+
+  private gotoSearchWith(sharedUrl: string): void {
+    try {
+      this.getUIContext().getRouter().pushUrl({
+        url: 'pages/SearchPage',
+        params: { sharedUrl: sharedUrl }
+      }).catch((err: Error) => {
+        Log.e(`分享链接跳转失败：${err.message}`);
+      });
+    } catch (e) {
+      Log.e(`分享链接跳转异常：${(e as Error).message}`);
+    }
   }
 
   private async reload(): Promise<void> {

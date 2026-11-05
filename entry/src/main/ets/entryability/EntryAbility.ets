@@ -7,13 +7,18 @@ import { Settings } from '../common/Settings';
 import { UiPrefs } from '../common/UiPrefs';
 import { LOG_DOMAIN, TAG } from '../common/Logger';
 
+/** 待路由的分享链接。冷启动时 Ability 直接 pushUrl 往往早于页面栈就绪（静默失败），
+ *  所以统一写进 AppStorage，由书架页 onPageShow 消费——那时栈一定就绪。 */
+export const PENDING_SHARE_KEY: string = 'pendingSharedUrl';
+
 export default class EntryAbility extends UIAbility {
   private mainWindowStage: window.WindowStage | null = null;
-  /** 窗口还没就绪时收到的分享先存着，loadContent 完成后再路由 */
-  private pendingSharedUrl: string = '';
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(LOG_DOMAIN, TAG, '%{public}s', 'Ability onCreate');
+    // 分享没跳转时靠这几行定位：是没拿到链接，还是拿到了没路由
+    hilog.info(LOG_DOMAIN, TAG, 'onCreate want action=%{public}s uri=%{public}s launchReason=%{public}d',
+      want.action, want.uri === undefined ? '(none)' : want.uri, launchParam.launchReason);
     // 数据库在 UI 加载前完成初始化，页面侧无需再关心上下文获取时序
     Db.init(this.context).catch((err: Error) => {
       hilog.error(LOG_DOMAIN, TAG, 'init db failed: %{public}s', err.message);
@@ -21,9 +26,13 @@ export default class EntryAbility extends UIAbility {
     // 配置存储同样需要上下文，一并在这里备好
     Settings.init(this.context);
     UiPrefs.init(this.context);
-    // 冷启动即被分享（浏览器里点分享选本应用）：先取链接，窗口就绪后跳导入页
+    // 冷启动即被分享：取链接是异步 IPC，loadContent 常常先跑完，
+    // 所以这里只负责把结果落进 AppStorage，路由交给书架页 onPageShow。
     EntryAbility.extractSharedUrl(want).then((url: string) => {
-      this.pendingSharedUrl = url;
+      if (url.length > 0) {
+        AppStorage.setOrCreate(PENDING_SHARE_KEY, url);
+        hilog.info(LOG_DOMAIN, TAG, '冷启动收到分享链接：%{public}s', url);
+      }
     }).catch(() => {
     });
   }
@@ -40,11 +49,6 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       hilog.info(LOG_DOMAIN, TAG, 'Succeeded in loading the content.');
-      if (this.pendingSharedUrl.length > 0) {
-        const url = this.pendingSharedUrl;
-        this.pendingSharedUrl = '';
-        this.routeToImport(url);
-      }
     });
 
     try {
@@ -54,10 +58,14 @@ export default class EntryAbility extends UIAbility {
     }
   }
 
-  /** 应用已在后台时又被分享：直接补路由 */
+  /**
+   * 应用已在后台时又被分享。这条路上页面栈是就绪的，可以直接 pushUrl；
+   * 仍先写 AppStorage 兜底——pushUrl 若失败，回前台时书架页 onPageShow 会补一次。
+   */
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     EntryAbility.extractSharedUrl(want).then((url: string) => {
       if (url.length > 0) {
+        AppStorage.setOrCreate(PENDING_SHARE_KEY, url);
         this.routeToImport(url);
       }
     }).catch(() => {
@@ -105,13 +113,26 @@ export default class EntryAbility extends UIAbility {
         return t;
       }
     }
+    // 最后一层兜底：不同来源的分享字段不一，parameters 里扫一遍字符串值
+    const params = want.parameters;
+    if (params !== undefined && params !== null) {
+      const keys = Object.keys(params);
+      for (let i = 0; i < keys.length; i++) {
+        const v = params[keys[i]];
+        if (typeof v === 'string') {
+          const t = (v as string).trim();
+          if (t.startsWith('http://') || t.startsWith('https://')) {
+            return t;
+          }
+        }
+      }
+    }
     return '';
   }
 
   private routeToImport(url: string): void {
     const ws = this.mainWindowStage;
     if (ws === null) {
-      this.pendingSharedUrl = url;
       return;
     }
     try {
@@ -119,12 +140,14 @@ export default class EntryAbility extends UIAbility {
       main.getUIContext().getRouter().pushUrl({
         url: 'pages/SearchPage',
         params: { sharedUrl: url }
+      }).then(() => {
+        // 推成功了就清掉兜底，避免回前台时书架页再推一次
+        AppStorage.setOrCreate(PENDING_SHARE_KEY, '');
       }).catch((err: Error) => {
         hilog.error(LOG_DOMAIN, TAG, 'route to search failed: %{public}s', err.message);
       });
     } catch (e) {
-      // 窗口还没完全就绪，存下来等 loadContent 回调补路由
-      this.pendingSharedUrl = url;
+      hilog.error(LOG_DOMAIN, TAG, 'route to search threw: %{public}s', (e as Error).message);
     }
   }
 }
