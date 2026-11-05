@@ -1154,7 +1154,7 @@ struct SearchPage {
 
           ForEach(this.bubbles, (b: Bubble) => {
             this.bubble(b)
-          }, (b: Bubble) => b.id)
+          }, (b: Bubble) => `${this.sessionId}:${b.id}`)
 
           // 流式输出中的这一轮
           if (this.streaming) {
