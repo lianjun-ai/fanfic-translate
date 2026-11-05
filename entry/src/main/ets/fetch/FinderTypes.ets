@@ -17,7 +17,7 @@ import { PendingItem } from './PendingStore';
  * 多个互不依赖的工具调用。所以省步数的正解是让模型并行发工具，而不是
  * 简单把这个数字调大 —— 调大只会让单次对话更慢更贵。
  */
-export const MAX_ROUNDS: number = 12;
+export const MAX_ROUNDS: number = 20;
 
 /** 剩余步数少于这个值时，工具返回里会带上「准备收尾」的提示 */
 export const ROUNDS_WARN_AT: number = 3;
