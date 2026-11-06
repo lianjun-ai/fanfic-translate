@@ -6,6 +6,7 @@ import { HtmlFileParser } from './HtmlFileParser';
 import { FileKind, FileTextReader } from './FileTextReader';
 import { ParsedWork } from './ParserTypes';
 import { Work } from '../model/Models';
+import { WorkDao } from '../data/WorkDao';
 import { WorkRepo } from '../data/WorkRepo';
 import { Log } from '../common/Logger';
 
@@ -14,6 +15,18 @@ export interface ImportResult {
   title: string;
   chapters: number;
   paragraphs: number;
+  /** > 0 表示本次是替换导入：书架旧版有这么章，已被新版覆盖 */
+  replacedFrom: number;
+}
+
+/**
+ * 外部已知的元信息（如待入库边车里来自站点的标题/作者）。
+ * HTML/TXT 文件本身往往不带作者，解析只能猜出「佚名」；
+ * 边车里的值比文件解析更权威，查重键也因此更准。
+ */
+export interface MetaOverride {
+  title: string;
+  author: string;
 }
 
 /** 待导入的一个文件 */
@@ -92,7 +105,8 @@ export class Importer {
    * 与 importFromUri 共享同一条解析管线，只差入口：uri 拷贝 vs 路径拷贝。
    */
   static async importFromPath(ctx: common.UIAbilityContext, localPath: string, fileName: string,
-    onProgress: (msg: string) => void, allowDuplicate: boolean = false): Promise<ImportResult> {
+    onProgress: (msg: string) => void, allowDuplicate: boolean = false,
+    metaOverride: MetaOverride | null = null, allowReplace: boolean = false): Promise<ImportResult> {
     const stamp = `${Date.now()}_${Math.floor(Math.random() * 100000)}`;
     const tmpPath = `${ctx.cacheDir}/import_${stamp}.zip`;
     const extractDir = `${ctx.cacheDir}/epub_${stamp}`;
@@ -100,7 +114,8 @@ export class Importer {
     try {
       onProgress('正在读取文件…');
       fs.copyFileSync(localPath, tmpPath);
-      return await Importer.importLocal(tmpPath, extractDir, fileName, onProgress, allowDuplicate);
+      return await Importer.importLocal(tmpPath, extractDir, fileName, onProgress,
+        allowDuplicate, metaOverride, allowReplace);
     } finally {
       Importer.cleanup(tmpPath, extractDir);
     }
@@ -108,7 +123,8 @@ export class Importer {
 
   /** 管线主体：沙箱内 .zip 临时文件 → 魔数嗅探 → 路由解析 → 查重 → 落库。不负责清理临时文件 */
   private static async importLocal(tmpPath: string, extractDir: string, fileName: string,
-    onProgress: (msg: string) => void, allowDuplicate: boolean): Promise<ImportResult> {
+    onProgress: (msg: string) => void, allowDuplicate: boolean,
+    metaOverride: MetaOverride | null = null, allowReplace: boolean = false): Promise<ImportResult> {
     const ext = Importer.extOf(fileName);
 
     let size = 0;
@@ -165,11 +181,33 @@ export class Importer {
           `解析出 ${parsed.chapters.length} 个章节但内容为空）`);
       }
 
+      // 边车等外部来源的标题/作者比文件解析出来的更权威：
+      // 不覆盖的话 HTML 抓来的书作者永远是「佚名」，查重键也跟着失准
+      if (metaOverride !== null) {
+        if (metaOverride.title.length > 0) {
+          parsed.title = metaOverride.title;
+        }
+        if (metaOverride.author.length > 0) {
+          parsed.author = metaOverride.author;
+        }
+      }
+
+      let replacedFrom = 0;
       // 查重要在解析之后：指纹得从正文算，只凭文件名判不准
       if (!allowDuplicate) {
         const dup = await WorkRepo.findDuplicate(parsed);
         if (dup !== null) {
-          throw new DuplicateError(dup);
+          // 新版章节数严格多于书架旧版 → 视为「连载更新/上次没抓全」，替换旧版。
+          // 只允许显式开启（待入库/命中下载流程）：批量导入选文件时保持
+          // 原来的「重复即跳过」，不替用户做删除书架数据的决定。
+          if (allowReplace && parsed.chapters.length > dup.chapterCount) {
+            onProgress(`书架旧版 ${dup.chapterCount} 章，新版 ${parsed.chapters.length} 章，正在替换…`);
+            await WorkDao.remove(dup.id);
+            replacedFrom = dup.chapterCount;
+            Log.i(`替换导入：《${dup.title}》${dup.chapterCount} 章 → ${parsed.chapters.length} 章`);
+          } else {
+            throw new DuplicateError(dup);
+          }
         }
       }
 
@@ -180,7 +218,8 @@ export class Importer {
         workId: workId,
         title: parsed.title,
         chapters: parsed.chapters.length,
-        paragraphs: paragraphCount
+        paragraphs: paragraphCount,
+        replacedFrom: replacedFrom
       };
       return result;
     } catch (e) {
