@@ -40,12 +40,16 @@ export interface WebPageFetched {
   title: string;
   paragraphs: ParsedParagraph[];
   chars: number;
+  /** 实际抓取的地址（镜像/接口替换后的），章节来源链接的上游 */
+  url: string;
 }
 
 /** 拼接用的一章 */
 export interface WebChapter {
   title: string;
   paragraphs: ParsedParagraph[];
+  /** 这一章的来源网页（切不出就空串）；补章/追更时靠它定位 */
+  url: string;
 }
 
 /**
@@ -84,13 +88,13 @@ export class WebToBook {
       if (WebToBook.mayBeAntiBot(res.note)) {
         return await WebToBook.fetchAfterBlock(target, res.note);
       }
-      return { ok: false, note: res.note, title: '', paragraphs: [], chars: 0 };
+      return { ok: false, note: res.note, title: '', paragraphs: [], chars: 0, url: target };
     }
     let text = '';
     try {
       text = FileTextReader.read(res.path);
     } catch (e) {
-      return { ok: false, note: `读取网页失败：${(e as Error).message}`, title: '', paragraphs: [], chars: 0 };
+      return { ok: false, note: `读取网页失败：${(e as Error).message}`, title: '', paragraphs: [], chars: 0, url: target };
     } finally {
       try {
         fs.unlinkSync(res.path);
@@ -107,7 +111,7 @@ export class WebToBook {
         return fromJson;
       }
       return {
-        ok: false, title: '', paragraphs: [], chars: 0,
+        ok: false, title: '', paragraphs: [], chars: 0, url: target,
         note: '这个地址返回的是接口数据（JSON），不是网页。正文就在这份 JSON 里：' +
           '用 manage_site_rules 写一条规则（marker 填 JSON 里的定位串，如 "data":；' +
           'json_content 填正文路径，如 data.content）再把这个接口地址交给 html_to_book；' +
@@ -115,7 +119,7 @@ export class WebToBook {
       };
     }
     if (text.indexOf('<') < 0) {
-      return { ok: false, note: '返回内容不是网页（可能被反爬拦截）', title: '', paragraphs: [], chars: 0 };
+      return { ok: false, note: '返回内容不是网页（可能被反爬拦截）', title: '', paragraphs: [], chars: 0, url: target };
     }
     const direct = WebToBook.processHtml(text, '', target);
     if (direct.ok) {
@@ -141,7 +145,7 @@ export class WebToBook {
     return {
       ok: out.ok,
       note: out.note.length > 0 ? `${out.note}；${hint}` : hint,
-      title: out.title, paragraphs: out.paragraphs, chars: out.chars
+      title: out.title, paragraphs: out.paragraphs, chars: out.chars, url: out.url
     };
   }
 
@@ -192,13 +196,13 @@ export class WebToBook {
       Log.i(`直抓被拦但渲染拿到正文：${url}（${rendered.chars} 字）`);
       return {
         ok: true, note: `直抓被拦（${note}），${rendered.note}`,
-        title: rendered.title, paragraphs: rendered.paragraphs, chars: rendered.chars
+        title: rendered.title, paragraphs: rendered.paragraphs, chars: rendered.chars, url: url
       };
     }
     Log.w(`直抓与渲染都没拿到正文：${url}`);
     return {
       ok: false, note: `${note}${block.length > 0 ? `（${AntiBot.hint(block)}）` : ''}；内置浏览器渲染也没拿到正文`,
-      title: '', paragraphs: [], chars: 0
+      title: '', paragraphs: [], chars: 0, url: url
     };
   }
 
@@ -239,7 +243,7 @@ export class WebToBook {
     return {
       ok: true,
       note: `已按站点规则「${hit.rule.note}」从接口数据里提取正文`,
-      title: title, paragraphs: capped.list, chars: capped.chars
+      title: title, paragraphs: capped.list, chars: capped.chars, url: url
     };
   }
 
@@ -258,7 +262,7 @@ export class WebToBook {
       const note = capped.truncated ? `${notePrefix}正文超过 ${MAX_PAGE_CHARS} 字，已截断` : notePrefix;
       return {
         ok: true, note: `${note}已按站点规则「${hit.rule.note}」提取正文`.trim(),
-        title: title, paragraphs: capped.list, chars: capped.chars
+        title: title, paragraphs: capped.list, chars: capped.chars, url: url
       };
     }
     const root = HtmlParser.parse(text);
@@ -270,7 +274,7 @@ export class WebToBook {
       // 解析器对某些页面结构抛异常时兜住，给出可读的失败原因而不是让整个工具调用崩掉
       Log.w(`正文抽取异常：${(e as Error).message}`);
       return {
-        ok: false, title: title, paragraphs: [], chars: 0,
+        ok: false, title: title, paragraphs: [], chars: 0, url: url,
         note: `解析页面时出错：${(e as Error).message}`
       };
     }
@@ -282,7 +286,7 @@ export class WebToBook {
     }
     if (paragraphs.length === 0) {
       return {
-        ok: false, title: title, paragraphs: [], chars: 0,
+        ok: false, title: title, paragraphs: [], chars: 0, url: url,
         note: '页面里没有正文（需要登录才能看、内容主要是图片、或反爬拦截；JS 动态渲染的页面已自动用内置浏览器渲染过）'
           + WebToBook.embeddedStateHint(text) + WebToBook.weiboHint(text)
       };
@@ -293,13 +297,13 @@ export class WebToBook {
     if (capped.chars < SHELL_TEXT_CHARS) {
       Log.w(`直抓只抽到 ${capped.chars} 字，判为壳页：${url}`);
       return {
-        ok: false, title: title, paragraphs: [], chars: 0,
+        ok: false, title: title, paragraphs: [], chars: 0, url: url,
         note: `${notePrefix}页面只抽到 ${capped.chars} 字，是壳页（正文由 JS 从接口取，源码里没有）`
           + WebToBook.embeddedStateHint(text) + WebToBook.weiboHint(text)
       };
     }
     const note = capped.truncated ? `${notePrefix}正文超过 ${MAX_PAGE_CHARS} 字，已截断` : notePrefix;
-    return { ok: true, note: note, title: title, paragraphs: capped.list, chars: capped.chars };
+    return { ok: true, note: note, title: title, paragraphs: capped.list, chars: capped.chars, url: url };
   }
 
   /** 截断保护：单页正文字符超过 MAX_PAGE_CHARS 时停手 */
@@ -530,7 +534,7 @@ export class WebToBook {
    * 就没有标题，硬切只会把文切碎。
    */
   /** 章节标题里的序号（「第十一章」→11）；取不到返回 0（序章、番外） */
-  private static chapterNumber(title: string): number {
+  static chapterNumber(title: string): number {
     const m = /第\s*([0-9]{1,4}|[一二三四五六七八九十百千零两]{1,6})\s*[章节回卷幕]/.exec(title);
     if (m === null || m.length < 2) {
       return 0;
@@ -564,7 +568,15 @@ export class WebToBook {
     return section + num;
   }
 
-  static splitChapters(paragraphs: ParsedParagraph[]): WebChapter[] | null {
+  /**
+   * 按文内标题切章。
+   *
+   * pageUrls / paraPage 是可选的来源追踪：paraPage[i] 是第 i 段来自第几页，
+   * pageUrls 是每页实际抓取的地址。两样都给了，切出的每章就带上「来自哪个
+   * 网页」—— 补章、追更、去重定位全靠这个链接，没有它章节和来源就断了。
+   */
+  static splitChapters(paragraphs: ParsedParagraph[], pageUrls: string[] = [],
+    paraPage: number[] = []): WebChapter[] | null {
     const marks: number[] = [];
     const titles: string[] = [];
     for (let i = 0; i < paragraphs.length; i++) {
@@ -626,7 +638,7 @@ export class WebToBook {
       for (let j = 0; j < leadEnd; j++) {
         lead.push(paragraphs[j]);
       }
-      out.push({ title: '序', paragraphs: lead });
+      out.push({ title: '序', paragraphs: lead, url: WebToBook.urlAt(pageUrls, paraPage, 0) });
     }
     for (let k = 0; k < marks.length; k++) {
       const start = marks[k];
@@ -652,9 +664,24 @@ export class WebToBook {
         // 只有标题、没内容的空章（标题贴在末尾）：并进上一章，别留空壳
         continue;
       }
-      out.push({ title: title, paragraphs: body });
+      out.push({ title: title, paragraphs: body, url: WebToBook.urlAt(pageUrls, paraPage, start) });
     }
     return out;
+  }
+
+  /** 段落所在页的来源链接；来源信息没给就退回空串 */
+  private static urlAt(pageUrls: string[], paraPage: number[], paraIdx: number): string {
+    if (paraPage.length === 0 || pageUrls.length === 0) {
+      return '';
+    }
+    if (paraIdx < 0 || paraIdx >= paraPage.length) {
+      return '';
+    }
+    const p = paraPage[paraIdx];
+    if (p < 0 || p >= pageUrls.length) {
+      return '';
+    }
+    return pageUrls[p];
   }
 
   /**

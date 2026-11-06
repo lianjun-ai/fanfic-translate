@@ -12,7 +12,8 @@ function toChapter(rs: relationalStore.ResultSet): Chapter {
     title: rs.getString(rs.getColumnIndex('title')),
     status: rs.getString(rs.getColumnIndex('status')),
     summary: rs.getString(rs.getColumnIndex('summary')),
-    translatedAt: rs.getLong(rs.getColumnIndex('translated_at'))
+    translatedAt: rs.getLong(rs.getColumnIndex('translated_at')),
+    sourceUrl: rs.getString(rs.getColumnIndex('source_url'))
   };
 }
 
@@ -25,7 +26,8 @@ export class ChapterDao {
       'title': c.title,
       'status': c.status,
       'summary': c.summary,
-      'translated_at': c.translatedAt
+      'translated_at': c.translatedAt,
+      'source_url': c.sourceUrl
     };
   }
 

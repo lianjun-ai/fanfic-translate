@@ -8,6 +8,11 @@ export interface ParsedParagraph {
 export interface ParsedChapter {
   title: string;
   paragraphs: ParsedParagraph[];
+  /**
+   * 这一章的来源网页（可选）。从文件解析时通常未知（undefined）；
+   * 抓取/合并管线在内存里组装章节时会带上，落库进 chapter.source_url。
+   */
+  url?: string;
 }
 
 export interface ParsedWork {

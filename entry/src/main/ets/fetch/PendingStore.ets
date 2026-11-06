@@ -15,6 +15,14 @@ import { Log } from '../common/Logger';
  *   发现书没了。现在要腾空间由用户自己在列表里移除。
  */
 
+/** 章节清单里的一条：章号 + 标题 + 来源网页 */
+export interface ChapterRef {
+  /** 章标题里的序号（读不出为 0） */
+  no: number;
+  title: string;
+  url: string;
+}
+
 /** 待入库条目（边车 JSON 的结构） */
 export interface PendingItem {
   title: string;
@@ -28,6 +36,11 @@ export interface PendingItem {
   /** EPUB 在沙箱里的绝对路径 */
   epubPath: string;
   savedAt: number;
+  /**
+   * 每章的标题与来源链接（按书的顺序）。旧边车没有这个字段（undefined），
+   * 一切相关逻辑都要按「没有就降级」处理，不阻断主流程。
+   */
+  chapterIndex?: ChapterRef[];
 }
 
 export class PendingStore {
@@ -42,7 +55,8 @@ export class PendingStore {
    * 而 cacheDir 会被系统随时清理，list() 又只扫 filesDir —— 如果只写
    * 边车不搬文件，待入库列表永远是空的。所以这里必须 copy 进 filesDir。
    */
-  static async save(ctx: common.UIAbilityContext, meta: FicMeta, epubPath: string): Promise<PendingItem> {
+  static async save(ctx: common.UIAbilityContext, meta: FicMeta, epubPath: string,
+    chapterIndex?: ChapterRef[]): Promise<PendingItem> {
     const dir = PendingStore.dirOf(ctx);
     if (!fs.accessSync(dir)) {
       fs.mkdirSync(dir, true);
@@ -66,6 +80,9 @@ export class PendingStore {
       epubPath: dest,
       savedAt: Date.now()
     };
+    if (chapterIndex !== undefined && chapterIndex.length > 0) {
+      item.chapterIndex = chapterIndex;
+    }
     const sidecar = `${dest}.json`;
     const f = fs.openSync(sidecar, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
     try {

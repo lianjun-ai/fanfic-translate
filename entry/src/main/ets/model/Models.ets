@@ -93,6 +93,8 @@ export interface Chapter {
   status: string;
   summary: string;
   translatedAt: number;
+  /** 这一章的来源网页；旧数据为空串 */
+  sourceUrl: string;
 }
 
 export interface Paragraph {

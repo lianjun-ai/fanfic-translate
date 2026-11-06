@@ -4,7 +4,7 @@ import { Dedupe } from './Dedupe';
 import { Log } from '../common/Logger';
 
 const DB_NAME: string = 'fanfic_translate.db';
-const DB_VERSION: number = 3;
+const DB_VERSION: number = 4;
 
 /**
  * 建表语句。字段与《需求开发文档》6.2 一一对应：
@@ -37,7 +37,8 @@ const SCHEMA: string[] = [
      title TEXT NOT NULL DEFAULT '',
      status TEXT NOT NULL DEFAULT 'pending',
      summary TEXT NOT NULL DEFAULT '',
-     translated_at INTEGER NOT NULL DEFAULT 0
+     translated_at INTEGER NOT NULL DEFAULT 0,
+     source_url TEXT NOT NULL DEFAULT ''
    )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_chapter_order ON chapter (work_id, index_no)`,
   `CREATE TABLE IF NOT EXISTS paragraph (
@@ -151,6 +152,10 @@ export class Db {
     }
     await store.executeSql('CREATE INDEX IF NOT EXISTS idx_work_sort ON work (sort_no)');
     await store.executeSql('CREATE INDEX IF NOT EXISTS idx_work_shelf ON work (shelf_id)');
+
+    // v3 → v4：chapter 表加来源链接。抓取管线现在记录每章的来源网页，
+    // 补章/追更按链接定位；旧章保持空串，一切逻辑按空降级。
+    await Db.addColumn(store, 'chapter', 'source_url', "TEXT NOT NULL DEFAULT ''");
 
     store.version = DB_VERSION;
     Log.i(`数据库就绪，version=${DB_VERSION}`);

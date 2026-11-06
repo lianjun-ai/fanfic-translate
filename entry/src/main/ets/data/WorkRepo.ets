@@ -48,7 +48,8 @@ export class WorkRepo {
         title: pc.title,
         status: ChapterStatus.PENDING,
         summary: '',
-        translatedAt: 0
+        translatedAt: 0,
+        sourceUrl: pc.url !== undefined ? pc.url : ''
       });
 
       const rows: Paragraph[] = [];
