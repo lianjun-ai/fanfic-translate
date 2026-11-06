@@ -1,10 +1,10 @@
 import { common } from '@kit.AbilityKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { webview } from '@kit.ArkWeb';
-import { DuplicateError, Importer } from '../parser/Importer';
+import { DuplicateError, Importer, ImportResult, MetaOverride } from '../parser/Importer';
 import { FicHub, FicMeta } from '../fetch/FicHub';
 import { AgentHooks, FinderResult, RunControl } from '../fetch/FinderTypes';
-import { FinderAgent } from '../fetch/FinderAgent';
+import { FinderAgent, CARD_MARK } from '../fetch/FinderAgent';
 import { HeadlessRenderer } from '../fetch/HeadlessRenderer';
 import { PendingItem, PendingStore } from '../fetch/PendingStore';
 import { Bubble, SessionData, SessionMeta, SessionStore } from '../fetch/SessionStore';
@@ -15,6 +15,75 @@ import { Log } from '../common/Logger';
 /** 从系统分享进入时带进来的路由参数 */
 interface SearchPageParams {
   sharedUrl: string;
+}
+
+/** 落盘时对超长的 tool 回包瘦身：气泡显示和压缩摘要用不到全文 */
+function slimHistory(src: ChatMessage[]): ChatMessage[] {
+  const out: ChatMessage[] = [];
+  for (let i = 0; i < src.length; i++) {
+    const m = src[i];
+    if (m.role === 'tool' && m.content.length > 2000) {
+      const slim: ChatMessage = {
+        role: 'tool',
+        content: `${m.content.substring(0, 2000)}\n(落盘时截断，原文 ${m.content.length} 字符)`,
+        tool_call_id: m.tool_call_id
+      };
+      out.push(slim);
+    } else {
+      out.push(m);
+    }
+  }
+  return out;
+}
+
+/**
+ * 对话流的 LazyForEach 数据源。
+ *
+ * 会话长了以后 ForEach 全量建组件是进页面卡顿的主因（几百个气泡一次全建），
+ * 换成 LazyForEach 后屏幕外的气泡只是数据、不建组件。气泡的变化只有三种：
+ * 追加一条、整批替换（切换会话）、清空（新对话）——都用不到删改单条。
+ *
+ * 重要约定：items 必须与页面的 this.bubbles 是同一个数组引用。
+ * reset() 负责建立/切换引用；页面自己 push 之后调 notifyAppended() 通知刷新。
+ */
+class BubbleSource implements IDataSource {
+  private items: Bubble[] = [];
+  private listeners: DataChangeListener[] = [];
+
+  /** 建立引用 / 整批替换：切换会话、清屏、初始化时调用 */
+  reset(items: Bubble[]): void {
+    this.items = items;
+    for (let i = 0; i < this.listeners.length; i++) {
+      this.listeners[i].onDataReloaded();
+    }
+  }
+
+  /** 追加通知：调用方先把气泡 push 进共享数组，再调这个 */
+  notifyAppended(): void {
+    const idx = this.items.length - 1;
+    for (let i = 0; i < this.listeners.length; i++) {
+      this.listeners[i].onDataAdd(idx);
+    }
+  }
+
+  totalCount(): number {
+    return this.items.length;
+  }
+
+  getData(index: number): Bubble {
+    return this.items[index];
+  }
+
+  registerDataChangeListener(listener: DataChangeListener): void {
+    this.listeners.push(listener);
+  }
+
+  unregisterDataChangeListener(listener: DataChangeListener): void {
+    const idx = this.listeners.indexOf(listener);
+    if (idx >= 0) {
+      this.listeners.splice(idx, 1);
+    }
+  }
 }
 
 const EXAMPLES: string[] = [
@@ -44,6 +113,8 @@ struct SearchPage {
   private lastScrollAt: number = 0;
 
   @State bubbles: Bubble[] = [];
+  /** 气泡的渲染数据源：与 bubbles 数组保持同一引用，变化时通知 LazyForEach */
+  private bubbleSrc: BubbleSource = new BubbleSource();
   @State busy: boolean = false;
   @State statusText: string = '';
   @State query: string = '';
@@ -72,6 +143,8 @@ struct SearchPage {
   private renderCtrl: webview.WebviewController = new webview.WebviewController();
 
   aboutToAppear(): void {
+    // 数据源与 bubbles 建立同引用（后续 push / reset 都维持这一约定）
+    this.bubbleSrc.reset(this.bubbles);
     this.readRouteParams();
     this.loadPending();
     this.restoreLastSession();
@@ -132,11 +205,14 @@ struct SearchPage {
     this.sessionCreatedAt = data.createdAt;
     this.sessionTitle = data.title;
     this.bubbles = data.bubbles;
-    // 历史里的 system 是存那一刻的提示词，换成当前这份再接着聊
+    this.bubbleSrc.reset(this.bubbles);
+    // 历史里的 system 是存那一刻的提示词，换成当前这份再接着聊；
+    // 但 [任务卡] 是上下文压缩的产物，必须保留——丢了它模型就只剩窗口内的短记忆
     const kept: ChatMessage[] = [];
     for (let i = 0; i < data.history.length; i++) {
-      if (data.history[i].role !== 'system') {
-        kept.push(data.history[i]);
+      const m = data.history[i];
+      if (m.role !== 'system' || m.content.startsWith(CARD_MARK)) {
+        kept.push(m);
       }
     }
     const sys: ChatMessage = { role: 'system', content: FinderAgent.systemPrompt() };
@@ -206,7 +282,7 @@ struct SearchPage {
       createdAt: this.sessionCreatedAt,
       updatedAt: Date.now(),
       bubbles: this.bubbles,
-      history: this.history
+      history: slimHistory(this.history)
     };
     SessionStore.save(ctx, data).then(() => {
       this.refreshSessions();
@@ -277,7 +353,8 @@ struct SearchPage {
   private pushBubble(kind: string, text: string): void {
     this.seq++;
     const b: Bubble = { id: `b${this.seq}`, kind: kind, text: text, meta: null };
-    this.bubbles = this.bubbles.concat([b]);
+    this.bubbles.push(b);
+    this.bubbleSrc.notifyAppended();
     this.scrollToBottom();
     this.schedulePersist();
   }
@@ -285,7 +362,8 @@ struct SearchPage {
   private pushHit(m: FicMeta): void {
     this.seq++;
     const b: Bubble = { id: `h${this.seq}`, kind: 'hit', text: m.title, meta: m };
-    this.bubbles = this.bubbles.concat([b]);
+    this.bubbles.push(b);
+    this.bubbleSrc.notifyAppended();
     this.scrollToBottom();
     this.schedulePersist();
   }
@@ -397,7 +475,8 @@ struct SearchPage {
         }
         // 中间轮是思考（灰底小字），收尾轮是最终回复（白底正文）
         const b: Bubble = { id: id, kind: isFinal ? 'reply' : 'think', text: text, meta: null };
-        this.bubbles = this.bubbles.concat([b]);
+        this.bubbles.push(b);
+        this.bubbleSrc.notifyAppended();
         this.scrollToBottom();
         this.schedulePersist();
       },
@@ -458,11 +537,23 @@ struct SearchPage {
     this.sessionCreatedAt = 0;
     this.history = [];
     this.bubbles = [];
+    this.bubbleSrc.reset(this.bubbles);
     this.expandedIds = [];
     this.statusText = '';
     this.streamText = '';
     this.streaming = false;
     this.seq = 0;
+  }
+
+  /** 入架成功的气泡：替换导入时必须明确警告旧版数据已丢弃 */
+  private importedBubble(res: ImportResult): void {
+    if (res.replacedFrom > 0) {
+      this.pushBubble('action', `✅《${res.title}》已加入书架（${res.chapters} 章）。` +
+        `书架旧版（${res.replacedFrom} 章）已被替换，旧版的阅读进度和未翻译内容已丢弃`);
+    } else {
+      this.pushBubble('action', `✅《${res.title}》已加入书架（${res.chapters} 章）`);
+    }
+    this.getUIContext().getPromptAction().showToast({ message: `《${res.title}》已加入书架` });
   }
 
   /** 待入库 → 书架 */
@@ -474,14 +565,16 @@ struct SearchPage {
     this.busy = true;
     this.statusText = `正在导入《${p.title}》…`;
     try {
+      // 边车里的标题/作者来自站点，比文件解析权威（HTML 抓来的书不带作者元信息）；
+      // allowReplace：抓回来的新版比书架旧版章节多时替换旧版（连载更新/上次没抓全）
+      const override: MetaOverride = { title: p.title, author: p.author };
       const res = await Importer.importFromPath(ctx, p.epubPath,
         `${FicHub.fileSafeName(p.title)}.epub`, (msg: string) => {
           this.statusText = msg;
-        }, false);
+        }, false, override, true);
       await PendingStore.remove(ctx, p);
       this.shelfUrls = this.shelfUrls.concat([p.sourceUrl]);
-      this.pushBubble('action', `✅《${res.title}》已加入书架（${res.chapters} 章）`);
-      this.getUIContext().getPromptAction().showToast({ message: `《${res.title}》已加入书架` });
+      this.importedBubble(res);
     } catch (e) {
       if (e instanceof DuplicateError) {
         await PendingStore.remove(ctx, p);
@@ -524,13 +617,15 @@ struct SearchPage {
         const p = snapshot[i];
         this.statusText = `正在导入《${p.title}》…（${i + 1}/${snapshot.length}）`;
         try {
+          const override: MetaOverride = { title: p.title, author: p.author };
           const res = await Importer.importFromPath(ctx, p.epubPath,
             `${FicHub.fileSafeName(p.title)}.epub`, (msg: string) => {
               this.statusText = msg;
-            }, false);
+            }, false, override, true);
           await PendingStore.remove(ctx, p);
           this.shelfUrls = this.shelfUrls.concat([p.sourceUrl]);
           done++;
+          this.importedBubble(res);
           Log.i(`批量入库：《${res.title}》`);
         } catch (e) {
           if (e instanceof DuplicateError) {
@@ -631,13 +726,13 @@ struct SearchPage {
         this.statusText = msg;
       });
       this.statusText = `正在解析《${meta.title}》…`;
+      const override: MetaOverride = { title: meta.title, author: meta.author };
       const res = await Importer.importFromPath(ctx, epubPath,
         `${FicHub.fileSafeName(meta.title)}.epub`, (msg: string) => {
           this.statusText = msg;
-        }, false);
+        }, false, override, true);
       this.shelfUrls = this.shelfUrls.concat([meta.sourceUrl]);
-      this.pushBubble('action', `✅《${res.title}》已加入书架（${res.chapters} 章）`);
-      this.getUIContext().getPromptAction().showToast({ message: `《${res.title}》已加入书架` });
+      this.importedBubble(res);
     } catch (e) {
       if (e instanceof DuplicateError) {
         this.shelfUrls = this.shelfUrls.concat([meta.sourceUrl]);
@@ -1146,37 +1241,50 @@ struct SearchPage {
       Column() {
       this.header()
 
-      Scroll(this.scroller) {
-        Column({ space: 10 }) {
-          if (this.bubbles.length === 0) {
+      // List + LazyForEach：屏幕外的气泡不建组件，长会话进页面不再卡顿。
+      // 原来的 Scroll+ForEach 会把几百个气泡一次性全部构建出来。
+      List({ scroller: this.scroller, space: 10 }) {
+        if (this.bubbles.length === 0) {
+          ListItem() {
             this.emptyState()
           }
+          .width('100%')
+        }
 
-          ForEach(this.bubbles, (b: Bubble) => {
+        LazyForEach(this.bubbleSrc, (b: Bubble) => {
+          ListItem() {
             this.bubble(b)
-          }, (b: Bubble) => `${this.sessionId}:${b.id}`)
+          }
+          .width('100%')
+        }, (b: Bubble) => `${this.sessionId}:${b.id}`)
 
-          // 流式输出中的这一轮
-          if (this.streaming) {
+        // 流式输出中的这一轮
+        if (this.streaming) {
+          ListItem() {
             this.streamingBubble()
           }
+          .width('100%')
+        }
 
-          if (this.busy && this.statusText.length > 0 && !this.streaming) {
+        if (this.busy && this.statusText.length > 0 && !this.streaming) {
+          ListItem() {
             this.thinkingIndicator()
           }
+          .width('100%')
+        }
 
-          // 待入库区固定在对话流末尾，不混进消息里
-          if (this.pendingList.length > 0 && this.showPending) {
+        // 待入库区固定在对话流末尾，不混进消息里
+        if (this.pendingList.length > 0 && this.showPending) {
+          ListItem() {
             this.pendingCard()
           }
+          .width('100%')
         }
-        .width('100%')
-        .padding({ left: $r('app.float.page_padding'), right: $r('app.float.page_padding'), bottom: 16 })
-        .alignItems(HorizontalAlign.Start)
       }
       .layoutWeight(1)
       .width('100%')
-      .align(Alignment.Top)
+      .padding({ left: $r('app.float.page_padding'), right: $r('app.float.page_padding'), bottom: 16 })
+      .alignListItem(ListItemAlign.Start)
       .scrollBar(BarState.Off)
 
       // 常驻入口：用户滚上去了也总能看见「有几本已下好」，点一下直达

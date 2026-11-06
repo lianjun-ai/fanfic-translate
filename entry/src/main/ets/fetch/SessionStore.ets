@@ -107,7 +107,9 @@ export class SessionStore {
 
   static async load(ctx: common.UIAbilityContext, id: string): Promise<SessionData | null> {
     try {
-      const txt = fs.readTextSync(SessionStore.filePath(ctx, id));
+      // 异步读：长会话文件可能好几 MB，同步 readTextSync 会把主线程卡死，
+      // 恢复会话时页面跟着一起冻住（JSON.parse 仍在主线程，量级可接受）
+      const txt = await fs.readText(SessionStore.filePath(ctx, id));
       const data = JSON.parse(txt) as SessionData;
       if (data === null || data === undefined) {
         return null;
@@ -128,10 +130,12 @@ export class SessionStore {
   static async save(ctx: common.UIAbilityContext, data: SessionData): Promise<void> {
     SessionStore.ensureDir(ctx);
     data.updatedAt = Date.now();
+    // 异步写：persist 在流式对话里每 400ms 触发一次，会话越长
+    // JSON.stringify + 写盘越贵，同步写会直接掉帧
     const f = fs.openSync(SessionStore.filePath(ctx, data.id),
       fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
     try {
-      fs.writeSync(f.fd, JSON.stringify(data));
+      await fs.write(f.fd, JSON.stringify(data));
     } finally {
       fs.closeSync(f);
     }
