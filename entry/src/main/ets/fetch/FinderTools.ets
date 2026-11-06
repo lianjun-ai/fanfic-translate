@@ -1,4 +1,5 @@
 import { fileIo as fs } from '@kit.CoreFileKit';
+import { common } from '@kit.AbilityKit';
 import { ToolDef } from '../provider/LlmProvider';
 import { FicHub, FicMeta, ProbeResult } from './FicHub';
 import { HttpFetch } from './HttpFetch';
@@ -11,7 +12,10 @@ import { AntiBot } from './AntiBot';
 import { FileTextReader } from '../parser/FileTextReader';
 import { HtmlParser } from '../parser/HtmlParser';
 import { XhtmlConverter } from '../parser/XhtmlConverter';
-import { PendingItem, PendingStore } from './PendingStore';
+import { ChapterRef, PendingItem, PendingStore } from './PendingStore';
+import { AppendOutcome, BookMerge, TargetRef } from './BookMerge';
+import { Dedupe } from '../data/Dedupe';
+import { WorkDao } from '../data/WorkDao';
 import { Tavily, TavilyHit } from './Tavily';
 import { WebPage, PageResult } from './WebPage';
 import { FinderCtx, MAX_ROUNDS, ROUNDS_WARN_AT } from './FinderTypes';
@@ -55,6 +59,16 @@ interface Budget {
   steps_left: number;
   /** 只在步数偏紧时非空：一句提醒，让模型开始收尾 */
   hint: string;
+}
+
+/** 工具层查重的命中结果 */
+interface DupHit {
+  /** 'pending'（待入库区）或 'shelf'（书架） */
+  where: string;
+  title: string;
+  chapters: number;
+  /** pending 命中时给出旧条目，放行新版时好顺手清掉 */
+  item: PendingItem | null;
 }
 
 /** 工具统一回填格式（定长结构，字段含义靠 status 区分） */
@@ -235,9 +249,18 @@ export class FinderTools {
       type: 'function',
       function: {
         name: 'html_to_book',
-        description: '把网页抓成本地书放进待入库区（FicHub 不支持的站点的兜底路，如 LOFTER、晋江免费章节、博客、论坛帖子串）。urls 按阅读顺序传数组，每个网页合成一章；只抓一个网页时也可以只传一个元素的数组。命中站点规则的站会按规则直接抽取（快）；否则静态页直抓、JS 动态渲染的页面自动用内置浏览器渲染后抽取（每页要多等十几秒）；裸请求被风控 403 时也会自动改用内置浏览器重试一次（能过知乎这类 JS 挑战页）；需要登录才能看、内容主要是图片或人机验证的页面才会抓不到正文而失败',
+        description: '把网页抓成本地书放进待入库区（FicHub 不支持的站点的兜底路，如 LOFTER、晋江免费章节、博客、论坛帖子串）。urls 按阅读顺序传数组，每个网页合成一章；只抓一个网页时也可以只传一个元素的数组。数量上限很高（几百个也行）：连载长篇把全部章节链接一次传齐，工具会逐页顺序抓取并聚合成同一本书，每页完成都会上报进度，个别页失败不影响其余页面（回包里会列出失败页）。命中站点规则的站会按规则直接抽取（快）；否则静态页直抓、JS 动态渲染的页面自动用内置浏览器渲染后抽取（每页要多等十几秒）；裸请求被风控 403 时也会自动改用内置浏览器重试一次（能过知乎这类 JS 挑战页）；需要登录才能看、内容主要是图片或人机验证的页面才会抓不到正文而失败',
         parameters: JSON.parse(
-          '{"type":"object","properties":{"urls":{"type":"array","items":{"type":"string"},"description":"按阅读顺序排列的网页地址，1~30 个"},"title":{"type":"string","description":"书名，不填就用第一个网页的标题"},"author":{"type":"string","description":"作者"}},"required":["urls"]}')
+          '{"type":"object","properties":{"urls":{"type":"array","items":{"type":"string"},"description":"按阅读顺序排列的网页地址，最多 300 个；连载长篇可一次给全目录，会聚合成同一本书"},"title":{"type":"string","description":"书名，不填就用第一个网页的标题"},"author":{"type":"string","description":"作者"}},"required":["urls"]}')
+      }
+    };
+    const addChapters: ToolDef = {
+      type: 'function',
+      function: {
+        name: 'add_chapters',
+        description: '把章节补进一本书（合并/补章/追更统一走这个工具）。target 是补进的目标书：待入库条目或书架作品的 书名/来源链接/路径；sources 是要补的内容，按阅读顺序传待入库条目（书名或来源链接）和/或网页链接。行为：待入库目标 → 和来源内容合成一本新的待入库条目（旧的清掉）；书架目标 → 新章直接插进书架那本书并按章号排序，已有章和它的译文/阅读进度绝不动。撞了已有章会跳过并在回包说明。来源网页的标题里读不出「第N章」时（LOFTER 帖子页很常见），务必把章号按顺序放进 numbers，否则新章只能追加在末尾。回包带「按章号看缺：20、30」这类提示时说明还差这些章，继续抓了再 add_chapters 一次',
+        parameters: JSON.parse(
+          '{"type":"object","properties":{"target":{"type":"string","description":"补进的目标书：待入库条目或书架作品（书名、来源链接或路径）"},"sources":{"type":"array","items":{"type":"string"},"description":"要补的内容，按阅读顺序：待入库条目（书名/来源链接）或网页链接"},"numbers":{"type":"array","items":{"type":"integer"},"description":"与 sources 解析出的章按顺序对应的章号（可选）。来源标题里读不出章号时必传，例：补第 20、30 章 → [20,30]"},"title":{"type":"string","description":"目标在待入库时可改书名，不填沿用目标原书名"},"author":{"type":"string","description":"作者（仅待入库目标生效）"},"keep_originals":{"type":"boolean","description":"是否保留原来的待入库条目，默认 false（合并成功后删除）"}},"required":["target","sources"]}')
       }
     };
     const debugFetch: ToolDef = {
@@ -285,7 +308,7 @@ export class FinderTools {
           '{"type":"object","properties":{"url":{"type":"string","description":"接口地址，http/https"},"method":{"type":"string","enum":["GET","POST"],"description":"默认 GET"},"body":{"type":"string","description":"POST 请求体；body_type=form 时形如 a=1&b=2，json 时是 JSON 文本"},"body_type":{"type":"string","enum":["form","json"],"description":"请求体类型，默认 form"},"referer":{"type":"string","description":"可选，Referer 头（很多站会校验）"},"max_chars":{"type":"integer","description":"返回文本保留多少字符，默认 6000，上限 20000"}},"required":["url"]}')
       }
     };
-    return [webSearch, fetchPage, probe, webBook, download, debugFetch, manageRules, readLogs, listLinks, httpProbeDef];
+    return [webSearch, fetchPage, probe, webBook, download, addChapters, debugFetch, manageRules, readLogs, listLinks, httpProbeDef];
   }
 
   /** 执行一次工具调用，返回喂回模型的 JSON */
@@ -304,6 +327,9 @@ export class FinderTools {
     }
     if (name === 'download_file') {
       return FinderTools.downloadFile(args, ctx, st);
+    }
+    if (name === 'add_chapters') {
+      return FinderTools.addChapters(args, ctx, st);
     }
     if (name === 'debug_fetch') {
       return FinderTools.debugFetch(args, ctx, st);
@@ -400,17 +426,15 @@ export class FinderTools {
       return FinderTools.reply('bad_args', '缺少 url 参数', null, '', st);
     }
     // 已经下过的不要再来一次：重复请求既占磁盘，又直接加剧 FicHub 限流
-    const already = await PendingStore.list(ctx.ui);
-    for (let i = 0; i < already.length; i++) {
-      if (already[i].sourceUrl === url) {
-        const hit: FicMeta = {
-          title: already[i].title, author: already[i].author, chapters: already[i].chapters,
-          words: already[i].words, info: already[i].info, epubUrl: '', sourceUrl: url
-        };
-        ctx.hooks.onAction(`　　《${hit.title}》已经下过了，跳过重复下载`);
-        return FinderTools.reply('ok', '这本之前已经下过了，就在待入库区，等用户点一下就进书架', hit,
-          already[i].epubPath, st);
-      }
+    const early = await FinderTools.checkDup(ctx, '', '', url, 0);
+    if (early !== null && early.item !== null) {
+      const hit: FicMeta = {
+        title: early.title, author: '', chapters: early.chapters,
+        words: 0, info: '已下载过', epubUrl: '', sourceUrl: url
+      };
+      ctx.hooks.onAction(`　　《${hit.title}》已经下过了，跳过重复下载`);
+      return FinderTools.reply('ok', '这本之前已经下过了，就在待入库区，等用户点一下就进书架', hit,
+        early.item.epubPath, st);
     }
     let meta = st.probed[url];
     if (meta === undefined) {
@@ -447,6 +471,12 @@ export class FinderTools {
       }
     }
     const m3 = meta;
+    // 探测出了标题/作者，这时还能查书架：书架里已有的别再花一两分钟下载
+    const dup = await FinderTools.checkDup(ctx, m3.title, m3.author, m3.sourceUrl, m3.chapters);
+    if (dup !== null) {
+      ctx.hooks.onAction(`　　《${dup.title}》已存在（${dup.where === 'shelf' ? '书架' : '待入库区'}，${dup.chapters} 章），跳过重复下载`);
+      return FinderTools.reply('exists', FinderTools.dupNote(dup), m3, '', st);
+    }
     ctx.hooks.onStatus(`正在下载《${m3.title}》…`);
     try {
       const path = await FicHub.downloadEpub(ctx.ui, m3, (m: string) => ctx.hooks.onStatus(m));
@@ -494,6 +524,13 @@ export class FinderTools {
       epubUrl: url,
       sourceUrl: url
     };
+    // 标题来自文件名时不可靠，作者没传时键为空——两种情况 checkDup 都只会按
+    // sourceUrl 拦，不会误伤；模型把标题作者都给全了才做键匹配
+    const dup = await FinderTools.checkDup(ctx, title, authorArg, url, 0);
+    if (dup !== null) {
+      ctx.hooks.onAction(`　　《${dup.title}》已存在（${dup.where === 'shelf' ? '书架' : '待入库区'}，${dup.chapters} 章），跳过重复下载`);
+      return FinderTools.reply('exists', FinderTools.dupNote(dup), meta, '', st);
+    }
     try {
       const item: PendingItem = await PendingStore.save(ctx.ui, meta, res.path);
       st.hits.push(meta);
@@ -520,21 +557,23 @@ export class FinderTools {
     if (urls.length === 0) {
       return FinderTools.reply('bad_args', '缺少 urls 参数（要抓的网页地址数组）', null, '', st);
     }
-    if (urls.length > 30) {
-      return FinderTools.reply('bad_args', `一次最多抓 30 个网页（收到 ${urls.length} 个），拆成几本书分次抓`, null, '', st);
+    // 300 只是防模型发疯（一次传几千个链接）的安全阀，不是分批边界：
+    // 内部本来就是一个循环逐页抓，几百页也一样聚合进同一本书。
+    if (urls.length > 300) {
+      return FinderTools.reply('bad_args', `单次最多 300 个网页（收到 ${urls.length} 个），超出部分分次调用并在回复里说明已抓到哪一段`, null, '', st);
     }
-    // 与 fichub_get 相同的去重约定：sourceUrl 记第一个网页，重复请求直接命中
-    const already = await PendingStore.list(ctx.ui);
-    for (let i = 0; i < already.length; i++) {
-      if (already[i].sourceUrl === urls[0]) {
-        const hit: FicMeta = {
-          title: already[i].title, author: already[i].author, chapters: already[i].chapters,
-          words: already[i].words, info: already[i].info, epubUrl: '', sourceUrl: urls[0]
-        };
-        ctx.hooks.onAction(`　　《${hit.title}》已经下过了，跳过重复抓取`);
-        return FinderTools.reply('ok', '这本之前已经抓过了，就在待入库区，等用户点一下就进书架', hit,
-          already[i].epubPath, st);
-      }
+    // 与 fichub_get 相同的去重约定：sourceUrl 记第一个网页。章数还没抓出来，
+    // 先拿「要抓的页数」当规模下限：旧版章节不会比页数少（一页至少一章），
+    // 要抓的页数比旧版章节数还多 → 这次必然更全，checkDup 会放行并清掉旧条目
+    const early = await FinderTools.checkDup(ctx, '', '', urls[0], urls.length);
+    if (early !== null && early.item !== null) {
+      const hit: FicMeta = {
+        title: early.title, author: '', chapters: early.chapters,
+        words: 0, info: '已抓取过', epubUrl: '', sourceUrl: urls[0]
+      };
+      ctx.hooks.onAction(`　　《${hit.title}》已经抓过了，跳过重复抓取`);
+      return FinderTools.reply('ok', '这本之前已经抓过了，就在待入库区，等用户点一下就进书架', hit,
+        early.item.epubPath, st);
     }
     ctx.hooks.onAction(`📄 抓网页成书：${urls.length} 个页面`);
     const dir = `${ctx.ui.cacheDir}/finder_dl`;
@@ -568,13 +607,17 @@ export class FinderTools {
     // 被页边界劈开。先把各页段落按顺序拼成一条，再按文内标题切；标题不够
     // 两个才退回「一页一章」。
     const merged: ParsedParagraph[] = [];
+    const pageUrls: string[] = [];
+    const paraPage: number[] = [];
     for (let i = 0; i < pages.length; i++) {
+      pageUrls.push(pages[i].url.length > 0 ? pages[i].url : urls[i]);
       for (let j = 0; j < pages[i].paragraphs.length; j++) {
         merged.push(pages[i].paragraphs[j]);
+        paraPage.push(i);
       }
     }
     const chapters: WebChapter[] = [];
-    const byHead = WebToBook.splitChapters(merged);
+    const byHead = WebToBook.splitChapters(merged, pageUrls, paraPage);
     if (byHead !== null) {
       for (let i = 0; i < byHead.length; i++) {
         chapters.push(byHead[i]);
@@ -587,8 +630,18 @@ export class FinderTools {
         const name = pages.length > 1
           ? (p.title.length > 0 ? p.title : `第 ${chapters.length + 1} 章`)
           : workTitle;
-        chapters.push({ title: name, paragraphs: p.paragraphs });
+        chapters.push({ title: name, paragraphs: p.paragraphs, url: pageUrls[i] });
       }
+    }
+    // 章节清单：章号 + 标题 + 来源链接，随边车落盘。补章/追更时模型靠它
+    // 直接知道「缺第几章、链接是什么」，不用再拿 list_links 试探
+    const chapterIndex: ChapterRef[] = [];
+    for (let i = 0; i < chapters.length; i++) {
+      chapterIndex.push({
+        no: WebToBook.chapterNumber(chapters[i].title),
+        title: chapters[i].title,
+        url: chapters[i].url
+      });
     }
     const html = WebToBook.buildHtml(workTitle, chapters);
     const path = `${dir}/web_${Date.now()}.html`;
@@ -607,8 +660,20 @@ export class FinderTools {
       epubUrl: '',
       sourceUrl: urls[0]
     };
+    // 章数已经真实切出来了，这时查重比早期拦截更准（书架+待入库、含章数比较）；
+    // 命中拦截就把刚生成的临时 HTML 删掉，别留下孤儿文件
+    const dup = await FinderTools.checkDup(ctx, workTitle, authorArg, urls[0], chapters.length);
+    if (dup !== null) {
+      try {
+        fs.unlinkSync(path);
+      } catch (e) {
+        // 删不掉无所谓
+      }
+      ctx.hooks.onAction(`　　《${dup.title}》已存在（${dup.where === 'shelf' ? '书架' : '待入库区'}，${dup.chapters} 章），跳过重复保存`);
+      return FinderTools.reply('exists', FinderTools.dupNote(dup), meta, '', st);
+    }
     try {
-      const item: PendingItem = await PendingStore.save(ctx.ui, meta, path);
+      const item: PendingItem = await PendingStore.save(ctx.ui, meta, path, chapterIndex);
       st.hits.push(meta);
       st.downloaded.push(item);
       ctx.hooks.onHit(meta);
@@ -622,6 +687,133 @@ export class FinderTools {
       const why = (e as Error).message;
       return FinderTools.reply('fail', `网页已抓取但入库失败：${why}`, null, path, st);
     }
+  }
+
+  /**
+   * add_chapters：把 sources 的章节补进 target —— 合并、补章、追更统一入口。
+   *
+   * target 可以是待入库条目（合成一本新的待入库 HTML）也可以是书架作品
+   * （新章直接插库、已有章与译文/进度不动）。找不到目标或来源时把
+   * 待入库区 + 书架的清单回给模型，让它自己修正参数重试。
+   */
+  private static async addChapters(args: Record<string, Object>, ctx: FinderCtx, st: FinderState): Promise<string> {
+    const targetTok = FinderTools.str(args, 'target');
+    const srcToks = FinderTools.strList(args, 'sources');
+    if (targetTok.length === 0 || srcToks.length === 0) {
+      return FinderTools.reply('bad_args',
+        '缺少 target（补进哪本书）或 sources（要补的内容：待入库条目或网页链接，按阅读顺序）', null, '', st);
+    }
+    const target: TargetRef | null = await BookMerge.resolveTarget(ctx.ui, targetTok);
+    if (target === null) {
+      const inv = await FinderTools.inventory(ctx.ui);
+      return FinderTools.reply('bad_args', `没找到目标「${targetTok}」。现有的：${inv}`, null, '', st);
+    }
+    const pend = await PendingStore.list(ctx.ui);
+    const sourceItems: PendingItem[] = [];
+    const sourceUrls: string[] = [];
+    const missing: string[] = [];
+    for (let i = 0; i < srcToks.length; i++) {
+      const t = srcToks[i];
+      let found: PendingItem | null = null;
+      for (let j = 0; j < pend.length; j++) {
+        const it = pend[j];
+        if (target.item !== null && it.epubPath === target.item.epubPath) {
+          continue;
+        }
+        if (it.epubPath === t || it.sourceUrl === t || it.title === t) {
+          found = it;
+          break;
+        }
+      }
+      if (found !== null) {
+        sourceItems.push(found);
+      } else if (/^https?:\/\//i.test(t)) {
+        sourceUrls.push(t);
+      } else {
+        missing.push(t);
+      }
+    }
+    if (missing.length > 0) {
+      const inv = await FinderTools.inventory(ctx.ui);
+      return FinderTools.reply('bad_args',
+        `这些没找到：${missing.join('；')}。现有的：${inv}。注意 sources 里的每一项要么是待入库条目（书名/来源链接），要么是 http(s) 网页链接`,
+        null, '', st);
+    }
+    if (sourceItems.length === 0 && sourceUrls.length === 0) {
+      return FinderTools.reply('bad_args', 'sources 里没有可用内容', null, '', st);
+    }
+    const parts: string[] = [];
+    for (let i = 0; i < sourceItems.length; i++) {
+      parts.push(`《${sourceItems[i].title}》`);
+    }
+    for (let i = 0; i < sourceUrls.length; i++) {
+      parts.push(sourceUrls[i]);
+    }
+    const targetTitle = target.kind === 'shelf'
+      ? (target.work !== null ? target.work.title : '')
+      : (target.item !== null ? target.item.title : '');
+    ctx.hooks.onAction(`📚 补章：《${targetTitle}》 ← ${parts.join(' + ')}`);
+    const titleArg = FinderTools.str(args, 'title');
+    const authorArg = FinderTools.str(args, 'author');
+    const keep = FinderTools.bool(args, 'keep_originals', false);
+    const numbers = FinderTools.numList(args, 'numbers');
+    try {
+      const out: AppendOutcome = await BookMerge.append(ctx.ui, target, sourceItems, sourceUrls,
+        titleArg, authorArg, keep, numbers, (m: string) => ctx.hooks.onStatus(m));
+      if (out.item !== null) {
+        const meta: FicMeta = {
+          title: out.item.title, author: out.item.author, chapters: out.item.chapters,
+          words: out.item.words, info: out.item.info, epubUrl: '', sourceUrl: out.item.sourceUrl
+        };
+        st.hits.push(meta);
+        st.downloaded.push(out.item);
+        ctx.hooks.onDownloaded(out.item);
+      } else {
+        ctx.hooks.onAction(`　　书架《${out.title}》已更新：+${out.added} 章，现共 ${out.totalChapters} 章`);
+      }
+      const where = out.kind === 'shelf'
+        ? `书架《${out.title}》已直接补章`
+        : `已合成新的待入库条目《${out.title}》`;
+      const skipNote = out.skipped > 0 ? `，${out.skipped} 章和已有内容重复被跳过` : '';
+      const orderNote = out.gaps.length > 0 ? `。${out.gaps}——继续把这些章抓了再 add_chapters 一次` : '';
+      const tailNote = out.unnumbered > 0
+        ? `。另有 ${out.unnumbered} 章标题里读不出章号，被追加在末尾（补章时尽量带上 numbers 章号参数）`
+        : '';
+      const keepNote = out.kind === 'pending'
+        ? (keep ? '；来源条目按你的要求保留' : '；原来的条目已清理')
+        : '；来源待入库条目保留着，用户可以自行清理';
+      const note = `${where}：+${out.added} 章，现共 ${out.totalChapters} 章${skipNote}` +
+        `。开头「${out.firstTitle}」，结尾「${out.lastTitle}」${orderNote}${tailNote}${keepNote}` +
+        '。核对没问题就让用户确认入库或在书架里查看';
+      const meta2: FicMeta | null = out.item !== null ? {
+        title: out.item.title, author: out.item.author, chapters: out.item.chapters,
+        words: out.item.words, info: out.item.info, epubUrl: '', sourceUrl: out.item.sourceUrl
+      } : null;
+      return FinderTools.reply('ok', note, meta2,
+        out.item !== null ? out.item.epubPath : '', st);
+    } catch (e) {
+      const why = (e as Error).message;
+      Log.e(`补章失败：${why}`);
+      ctx.hooks.onAction(`　　补章失败：${why}`);
+      return FinderTools.reply('fail', `补章失败：${why}`, null, '', st);
+    }
+  }
+
+  /** 待入库区 + 书架的完整清单（找不到目标/来源时回给模型自愈） */
+  private static async inventory(ui: common.UIAbilityContext): Promise<string> {
+    const lines: string[] = [];
+    const pend = await PendingStore.list(ui);
+    for (let i = 0; i < pend.length; i++) {
+      lines.push(`[待入库]《${pend[i].title}》${pend[i].chapters} 章 · 来源 ${pend[i].sourceUrl}`);
+    }
+    const works = await WorkDao.list();
+    for (let i = 0; i < works.length; i++) {
+      lines.push(`[书架]《${works[i].title}》${works[i].chapterCount} 章`);
+    }
+    if (lines.length === 0) {
+      return '（待入库区和书架都是空的）';
+    }
+    return lines.join(' ｜ ');
   }
 
   /**
@@ -966,6 +1158,61 @@ export class FinderTools {
     return def;
   }
 
+  /**
+   * 工具层查重：落盘前拦住重复抓取/下载，别让用户看到同一本书下了两遍。
+   *
+   * 只在「身份足够强」时才拦，宁可不拦也不错杀：
+   * - 待入库区 sourceUrl 精确匹配（同一地址反复下）；
+   * - 待入库区 / 书架的 标题+作者键匹配（双方作者都非空才比，
+   *   佚名和佚名的同名书是两回事，不能互撞）。
+   *
+   * 章节数可比时（newChapters > 0 且旧版也有章数），新版更全就放行，
+   * 并清掉旧 pending 条目——这是「连载追更 / 上次没抓全再抓一次」的通道；
+   * 放行后的书架替换由 Importer 入库时兜底（allowReplace）。
+   */
+  private static async checkDup(ctx: FinderCtx, title: string, author: string,
+    sourceUrl: string, newChapters: number): Promise<DupHit | null> {
+    const key = (title.length > 0 && author.length > 0) ? Dedupe.keyOf(title, author) : '';
+    if (sourceUrl.length === 0 && key.length === 0) {
+      return null;
+    }
+    const pend = await PendingStore.list(ctx.ui);
+    for (let i = 0; i < pend.length; i++) {
+      const it = pend[i];
+      const urlHit = sourceUrl.length > 0 && it.sourceUrl === sourceUrl;
+      const keyHit = key.length > 0 && it.author.length > 0 &&
+        Dedupe.keyOf(it.title, it.author) === key;
+      if (urlHit || keyHit) {
+        if (newChapters > 0 && it.chapters > 0 && newChapters > it.chapters) {
+          await PendingStore.remove(ctx.ui, it);
+          ctx.hooks.onAction(`　　待入库区已有旧版（${it.chapters} 章），本次规模更大（${newChapters}），清掉旧版重抓`);
+          return null;
+        }
+        return { where: 'pending', title: it.title, chapters: it.chapters, item: it };
+      }
+    }
+    if (key.length === 0) {
+      return null;
+    }
+    const w = await WorkDao.findByDedupeKey(key);
+    if (w !== null) {
+      if (newChapters > 0 && w.chapterCount > 0 && newChapters > w.chapterCount) {
+        ctx.hooks.onAction(`　　书架已有旧版（${w.chapterCount} 章），本次抓到 ${newChapters} 章更全，继续（入库时替换旧版）`);
+        return null;
+      }
+      return { where: 'shelf', title: w.title, chapters: w.chapterCount, item: null };
+    }
+    return null;
+  }
+
+  /** 查重命中时给模型的解释：说清在哪、让它怎么转述 */
+  private static dupNote(hit: DupHit): string {
+    if (hit.where === 'shelf') {
+      return `这本已在书架（${hit.chapters} 章），不要重复下载，直接告诉用户书架里已经有这本`;
+    }
+    return `这本之前已抓过（${hit.chapters} 章），就在待入库区等用户确认入库，不要重复下载`;
+  }
+
   private static reply(status: string, note: string, meta: FicMeta | null, path: string, st: FinderState): string {
     const b = FinderTools.budget(st);
     const r: ToolReply = {
@@ -1019,6 +1266,38 @@ export class FinderTools {
       if (one.length > 0) {
         out.push(one);
       }
+    }
+    return out;
+  }
+
+  /** 从参数里取整数数组（add_chapters 的 numbers）；解析不了的按 0 占位，保持对齐 */
+  private static numList(args: Record<string, Object>, key: string): number[] {
+    const out: number[] = [];
+    const v = args[key];
+    if (Array.isArray(v)) {
+      const arr = v as Object[];
+      for (let i = 0; i < arr.length; i++) {
+        const n = Number(arr[i]);
+        out.push(Number.isNaN(n) ? 0 : Math.max(0, Math.floor(n)));
+      }
+    }
+    return out;
+  }
+
+  /** 从参数里取字符串数组（sources/books）；也容忍模型把单个值塞成字符串 */
+  private static strList(args: Record<string, Object>, key: string): string[] {
+    const out: string[] = [];
+    const v = args[key];
+    if (Array.isArray(v)) {
+      const arr = v as string[];
+      for (let i = 0; i < arr.length; i++) {
+        const e = arr[i];
+        if (typeof e === 'string' && e.trim().length > 0) {
+          out.push(e.trim());
+        }
+      }
+    } else if (typeof v === 'string' && (v as string).trim().length > 0) {
+      out.push((v as string).trim());
     }
     return out;
   }
