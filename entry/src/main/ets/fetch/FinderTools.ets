@@ -25,6 +25,10 @@ import { Log } from '../common/Logger';
 const MAX_PROBES: number = 6;
 /** http_probe 回包保留的最大字符数 */
 const MAX_PROBE_CHARS: number = 20000;
+/** html_to_book 单次最多抓取的页数（防目录展开失控、防模型发疯，安全阀不是分批边界） */
+const MAX_BOOK_PAGES: number = 300;
+/** list_links 回包最多返回的链接条数（与 html_to_book 的页数上限对齐） */
+const MAX_LINKS_REPLY: number = 300;
 
 /**
  * 找文 Agent 的工具箱。
@@ -153,6 +157,31 @@ interface LinksReply {
   hint: string;
 }
 
+/** check_pending 的回包 */
+interface PendingBrief {
+  title: string;
+  author: string;
+  chapters: number;
+  source_url: string;
+}
+
+interface ShelfBrief {
+  title: string;
+  author: string;
+  chapters: number;
+}
+
+interface PendingReply {
+  status: string;
+  pending_count: number;
+  shelf_count: number;
+  pending: PendingBrief[];
+  shelf: ShelfBrief[];
+  note: string;
+  steps_left: number;
+  hint: string;
+}
+
 /** http_probe 的回包 */
 interface ProbeReply {
   status: string;
@@ -249,7 +278,7 @@ export class FinderTools {
       type: 'function',
       function: {
         name: 'html_to_book',
-        description: '把网页抓成本地书放进待入库区（FicHub 不支持的站点的兜底路，如 LOFTER、晋江免费章节、博客、论坛帖子串）。urls 按阅读顺序传数组，每个网页合成一章；只抓一个网页时也可以只传一个元素的数组。数量上限很高（几百个也行）：连载长篇把全部章节链接一次传齐，工具会逐页顺序抓取并聚合成同一本书，每页完成都会上报进度，个别页失败不影响其余页面（回包里会列出失败页）。命中站点规则的站会按规则直接抽取（快）；否则静态页直抓、JS 动态渲染的页面自动用内置浏览器渲染后抽取（每页要多等十几秒）；裸请求被风控 403 时也会自动改用内置浏览器重试一次（能过知乎这类 JS 挑战页）；需要登录才能看、内容主要是图片或人机验证的页面才会抓不到正文而失败',
+        description: '把网页抓成本地书放进待入库区（FicHub 不支持的站点的兜底路，如 LOFTER、晋江免费章节、博客、论坛帖子串）。urls 按阅读顺序传数组，每个网页合成一章；只抓一个网页时也可以只传一个元素的数组。目录页/作品页链接直接传进来即可：工具认出目录页会自动展开全部章节链接逐页抓取（对话体小说站、连载目录页都适用），不用你自己枚举几百个章节链接。数量上限 300 页：连载长篇一次传全目录或只传目录页都行，工具会聚合成同一本书，每页完成都会上报进度，个别页失败不影响其余页面（回包里会列出失败页）。命中站点规则的站会按规则直接抽取（快）；否则静态页直抓、JS 动态渲染的页面自动用内置浏览器渲染后抽取（每页要多等十几秒）；裸请求被风控 403 时也会自动改用内置浏览器重试一次（能过知乎这类 JS 挑战页）；需要登录才能看、内容主要是图片或人机验证的页面才会抓不到正文而失败',
         parameters: JSON.parse(
           '{"type":"object","properties":{"urls":{"type":"array","items":{"type":"string"},"description":"按阅读顺序排列的网页地址，最多 300 个；连载长篇可一次给全目录，会聚合成同一本书"},"title":{"type":"string","description":"书名，不填就用第一个网页的标题"},"author":{"type":"string","description":"作者"}},"required":["urls"]}')
       }
@@ -276,7 +305,7 @@ export class FinderTools {
       type: 'function',
       function: {
         name: 'manage_site_rules',
-        description: '查看或维护「站点抓取规则」。规则告诉 html_to_book 怎么从某个站抽正文，两种写法：①内嵌数据规则：marker（源码里的 JSON 定位标记，如 __initialize_data__）+ json_content（正文在 JSON 里的点分路径，如 postData.data.postView.content），可选 json_title；②元素规则：selector 定位正文容器（如 div.post-content、article）。action=list 列出现有规则（含哪些被临时停用）；action=add 添加或按 url_pattern 覆盖（先用 debug_fetch 的 data_outline 推断路径，写完直接重试 html_to_book 验证）；action=remove 删除自定义规则（内置规则不可删）；action=disable 临时停用某条规则（内置规则也能停：用来验证这条规则是不是唯一依赖，或让这个站从头走通用解析）；action=enable 恢复。规则存本地，立即生效，不用重新装应用',
+        description: '查看或维护「站点抓取规则」。规则告诉 html_to_book 怎么从某个站抽正文，两种写法：①内嵌数据规则：marker（源码里的 JSON 定位标记，如 __initialize_data__）+ json_content（正文在 JSON 里的点分路径，如 postData.data.postView.content），可选 json_title；②元素规则：selector 定位正文容器（如 div.post-content、article）。action=list 列出现有规则（含哪些被临时停用）；action=add 添加或按 url_pattern 覆盖（先用 debug_fetch 的 data_outline 推断路径，写完直接重试 html_to_book 验证）；action=remove 删除自定义规则（内置规则不可删）；action=disable 临时停用某条规则（内置规则也能停：用来验证这条规则是不是唯一依赖，或让这个站从头走通用解析）；action=enable 恢复。规则存本地，立即生效，不用重新装应用。注意：少数站有内置的代码级处理器（如话本小说的对话体），它们优先级高于用户规则——这些站不用写规则，写了也不会生效',
         parameters: JSON.parse(
           '{"type":"object","properties":{"action":{"type":"string","enum":["list","add","remove","disable","enable"],"description":"list=列出全部规则（标注停用项），add=添加/覆盖，remove=删除，disable=临时停用，enable=恢复"},"url_pattern":{"type":"string","description":"URL 匹配子串，如 lofter.com/post；命中即用这条规则"},"marker":{"type":"string","description":"内嵌 JSON 定位标记"},"json_title":{"type":"string","description":"标题的点分路径，可空（配合 title_from_first_paragraph）"},"json_content":{"type":"string","description":"正文 HTML 的点分路径"},"selector":{"type":"string","description":"正文容器选择器（tag.class / .class / #id / tag）。加 all: 前缀（如 all:div.content）会收集全部匹配的容器并按文档顺序拼接，用于贴吧这类每层楼正文各占一个容器的页面"},"title_from_first_paragraph":{"type":"boolean","description":"无标题时用首段前 40 字当书名，默认 true"},"note":{"type":"string","description":"规则备注，如站点名"}},"required":["action"]}')
       }
@@ -294,9 +323,17 @@ export class FinderTools {
       type: 'function',
       function: {
         name: 'list_links',
-        description: '列出网页上的链接清单。对 LOFTER 博客（传博客主页或任意一篇帖子的链接）会自动走 LOFTER 归档接口拿到整个博客的文章清单（标题+链接+发布日期，按时间正序），免登录——抓 LOFTER 系列文/合集先用它拿章节目录，再挑出目标章节的 url 传给 html_to_book。keyword 可按标题过滤。其它站点则解析页面里的站内 <a> 链接',
+        description: '列出网页上的链接清单。对 LOFTER 博客（传博客主页或任意一篇帖子的链接）会自动走 LOFTER 归档接口拿到整个博客的文章清单（标题+链接+发布日期，按时间正序），免登录——抓 LOFTER 系列文/合集先用它拿章节目录，再挑出目标章节的 url 传给 html_to_book。keyword 可按标题过滤。其它站点则解析页面里的站内 <a> 链接，最多返回 300 条；超出会截断并在 note 里说明剩余条数与分批办法',
         parameters: JSON.parse(
           '{"type":"object","properties":{"url":{"type":"string","description":"LOFTER 博客主页或该博客任意一篇帖子的链接；其它站点传列表页/目录页地址"},"keyword":{"type":"string","description":"可选，只返回标题含此关键字的条目"}},"required":["url"]}')
+      }
+    };
+    const checkPending: ToolDef = {
+      type: 'function',
+      function: {
+        name: 'check_pending',
+        description: '查看待入库区和书架的真实状态：待入库条目（书名/作者/章数/来源链接）和书架作品概要（书名/作者/章数）。判断「这本是不是已经抓过、抓到了哪一章、书架上还有什么」时调它，不要凭对话记忆猜——查重工具只拦单次抓取，跨回合的判断靠这个',
+        parameters: JSON.parse('{"type":"object","properties":{}}')
       }
     };
     const httpProbeDef: ToolDef = {
@@ -308,7 +345,7 @@ export class FinderTools {
           '{"type":"object","properties":{"url":{"type":"string","description":"接口地址，http/https"},"method":{"type":"string","enum":["GET","POST"],"description":"默认 GET"},"body":{"type":"string","description":"POST 请求体；body_type=form 时形如 a=1&b=2，json 时是 JSON 文本"},"body_type":{"type":"string","enum":["form","json"],"description":"请求体类型，默认 form"},"referer":{"type":"string","description":"可选，Referer 头（很多站会校验）"},"max_chars":{"type":"integer","description":"返回文本保留多少字符，默认 6000，上限 20000"}},"required":["url"]}')
       }
     };
-    return [webSearch, fetchPage, probe, webBook, download, addChapters, debugFetch, manageRules, readLogs, listLinks, httpProbeDef];
+    return [webSearch, fetchPage, probe, webBook, download, addChapters, debugFetch, manageRules, readLogs, listLinks, checkPending, httpProbeDef];
   }
 
   /** 执行一次工具调用，返回喂回模型的 JSON */
@@ -342,6 +379,9 @@ export class FinderTools {
     }
     if (name === 'list_links') {
       return FinderTools.listLinks(args, ctx, st);
+    }
+    if (name === 'check_pending') {
+      return FinderTools.checkPendingList(ctx, st);
     }
     if (name === 'http_probe') {
       return FinderTools.httpProbe(args, ctx, st);
@@ -564,36 +604,79 @@ export class FinderTools {
     }
     // 与 fichub_get 相同的去重约定：sourceUrl 记第一个网页。章数还没抓出来，
     // 先拿「要抓的页数」当规模下限：旧版章节不会比页数少（一页至少一章），
-    // 要抓的页数比旧版章节数还多 → 这次必然更全，checkDup 会放行并清掉旧条目
-    const early = await FinderTools.checkDup(ctx, '', '', urls[0], urls.length);
-    if (early !== null && early.item !== null) {
-      const hit: FicMeta = {
-        title: early.title, author: '', chapters: early.chapters,
-        words: 0, info: '已抓取过', epubUrl: '', sourceUrl: urls[0]
-      };
-      ctx.hooks.onAction(`　　《${hit.title}》已经抓过了，跳过重复抓取`);
-      return FinderTools.reply('ok', '这本之前已经抓过了，就在待入库区，等用户点一下就进书架', hit,
-        early.item.epubPath, st);
+    // 要抓的页数比旧版章节数还多 → 这次必然更全，checkDup 会放行并清掉旧条目。
+    // 单 URL 不做早期拦截：它多半是目录页，真实章数要等目录展开才知道，
+    // 拿 1 当规模会误拦「同源重抓」（重抓覆盖旧条目）；抓完后的最终 checkDup
+    // 用真实章数判断，那里才能放行。
+    if (urls.length > 1) {
+      const early = await FinderTools.checkDup(ctx, '', '', urls[0], urls.length);
+      if (early !== null && early.item !== null) {
+        const hit: FicMeta = {
+          title: early.title, author: '', chapters: early.chapters,
+          words: 0, info: '已抓取过', epubUrl: '', sourceUrl: urls[0]
+        };
+        ctx.hooks.onAction(`　　《${hit.title}》已经抓过了，跳过重复抓取`);
+        return FinderTools.reply('ok', '这本之前已经抓过了，就在待入库区，等用户点一下就进书架', hit,
+          early.item.epubPath, st);
+      }
     }
     ctx.hooks.onAction(`📄 抓网页成书：${urls.length} 个页面`);
     const dir = `${ctx.ui.cacheDir}/finder_dl`;
     const pages: WebPageFetched[] = [];
     const failedNotes: string[] = [];
+    const expandedNotes: string[] = [];
     let totalChars = 0;
-    for (let i = 0; i < urls.length; i++) {
-      ctx.hooks.onStatus(urls.length > 1 ? `正在抓取第 ${i + 1}/${urls.length} 页…` : '正在抓取网页…');
-      const p = await WebToBook.fetchPage(urls[i], dir);
+    // 队列式抓取：目录页在原地展开成内页链接插回队列，阅读顺序不乱。
+    // queued 记录所有入过队的地址 —— 目录页不会被重复展开，模型显式传过的
+    // 页面也不会因为又出现在目录里而被抓两次。上限仍由 MAX_BOOK_PAGES 兜底。
+    const queue = urls.slice();
+    const queued = new Set<string>(queue);
+    /** 与 pages 对齐的原始请求地址（fetchPage 可能改写 p.url，回退时用它） */
+    const requestedUrls: string[] = [];
+    for (let qi = 0; qi < queue.length && pages.length < MAX_BOOK_PAGES; qi++) {
+      const pageUrl = queue[qi];
+      ctx.hooks.onStatus(`正在抓取第 ${qi + 1}/${queue.length} 页…`);
+      const p = await WebToBook.fetchPage(pageUrl, dir);
       if (p.ok) {
+        // 目录页自动展开：源码里与本页同路径前缀的内页链接够多，就把它们插回
+        // 队列逐页抓，目录页本身不进正文 —— 模型不用再枚举几百个章节链接
+        const html = p.html !== undefined ? p.html : '';
+        if (html.length > 0) {
+          const links = WebList.expandCatalog(html, pageUrl);
+          if (links.length > 0) {
+            expandedNotes.push(`「${p.title.length > 0 ? p.title : pageUrl}」展开出 ${links.length} 个内页`);
+            ctx.hooks.onAction(`　　「${p.title.length > 0 ? p.title : pageUrl}」是目录页：展开出 ${links.length} 个内页链接，继续逐页抓取`);
+            // 只插没入过队的：分页目录的「下一页」会互相展开，不过滤的话
+            // 两个目录页会无限互相插队（pages 不增长，循环条件永远成立）→ 挂死
+            let insertAt = qi + 1;
+            for (let k = 0; k < links.length; k++) {
+              if (!queued.has(links[k])) {
+                queue.splice(insertAt, 0, links[k]);
+                insertAt++;
+                queued.add(links[k]);
+              }
+            }
+            continue;
+          }
+        }
+        // 源码的使命（目录判定）已完成，别让它跟着 pages 常驻内存：
+        // 几百页 × 每页几百 KB 的原始 HTML 会把内存顶爆
+        p.html = undefined;
         pages.push(p);
+        requestedUrls.push(pageUrl);
         totalChars += p.chars;
-        ctx.hooks.onAction(`　　第 ${i + 1} 页「${p.title.length > 0 ? p.title : urls[i]}」：约 ${p.chars} 字${p.note.length > 0 ? `（${p.note}）` : ''}`);
+        ctx.hooks.onAction(`　　第 ${pages.length} 页「${p.title.length > 0 ? p.title : pageUrl}」：约 ${p.chars} 字${p.note.length > 0 ? `（${p.note}）` : ''}`);
       } else {
-        failedNotes.push(`第 ${i + 1} 个（${urls[i]}）：${p.note}`);
-        ctx.hooks.onAction(`　　第 ${i + 1} 页抓取失败：${p.note}`);
+        failedNotes.push(`「${pageUrl}」：${p.note}`);
+        ctx.hooks.onAction(`　　「${pageUrl}」抓取失败：${p.note}`);
       }
     }
     if (pages.length === 0) {
-      const why = failedNotes.join('；');
+      // 目录展开后可能有上百个失败页，全列出来回包会爆，只举前几例 + 计数
+      const shown = failedNotes.slice(0, 5).join('；');
+      const why = failedNotes.length > 5
+        ? `${shown}（另有 ${failedNotes.length - 5} 个页面同样失败，从略）`
+        : shown;
       return FinderTools.reply('fail',
         `所有页面都没抓到正文（已尝试直接抓取和内置浏览器渲染）。${why}。这类页面通常需要登录后才能看，或内容主要是图片、反爬极强（微博、小红书、番茄等），` +
         '可以建议用户：在浏览器里打开文章、等正文显示后把链接分享给本应用，或复制正文存成 TXT 从「导入本地文件」进来',
@@ -610,7 +693,8 @@ export class FinderTools {
     const pageUrls: string[] = [];
     const paraPage: number[] = [];
     for (let i = 0; i < pages.length; i++) {
-      pageUrls.push(pages[i].url.length > 0 ? pages[i].url : urls[i]);
+      // 目录展开后 pages 与 urls 不再一一对应，回退只能用每页自己的请求地址
+      pageUrls.push(pages[i].url.length > 0 ? pages[i].url : requestedUrls[i]);
       for (let j = 0; j < pages[i].paragraphs.length; j++) {
         merged.push(pages[i].paragraphs[j]);
         paraPage.push(i);
@@ -656,7 +740,9 @@ export class FinderTools {
       author: authorArg,
       chapters: chapters.length,
       words: totalChars,
-      info: urls.length > 1 ? `网页抓取 · ${pages.length}/${urls.length} 页` : '网页抓取',
+      info: expandedNotes.length > 0
+        ? `网页抓取 · ${pages.length} 页（目录展开 ${expandedNotes.length} 处）`
+        : (urls.length > 1 ? `网页抓取 · ${pages.length}/${urls.length} 页` : '网页抓取'),
       epubUrl: '',
       sourceUrl: urls[0]
     };
@@ -679,9 +765,15 @@ export class FinderTools {
       ctx.hooks.onHit(meta);
       ctx.hooks.onAction(`📥 已抓成书：《${workTitle}》（待入库，${chapters.length} 章）`);
       ctx.hooks.onDownloaded(item);
-      const note = pages.length < urls.length
-        ? `已放进待入库区（${urls.length - pages.length} 个页面抓取失败：${failedNotes.join('；')}）`
+      const failBrief = failedNotes.length > 5
+        ? `${failedNotes.slice(0, 5).join('；')}（另有 ${failedNotes.length - 5} 个页面同样失败，从略）`
+        : failedNotes.join('；');
+      let note = failedNotes.length > 0
+        ? `已放进待入库区（${failedNotes.length} 个页面抓取失败：${failBrief}）`
         : '已放进待入库区，用户确认后才会进书架';
+      if (expandedNotes.length > 0) {
+        note = `${note}。目录页已自动展开：${expandedNotes.join('；')}——书按展开后的完整目录合成，不用再补传章节链接`;
+      }
       return FinderTools.reply('ok', note, meta, item.epubPath, st);
     } catch (e) {
       const why = (e as Error).message;
@@ -1018,12 +1110,54 @@ export class FinderTools {
     const res = await WebList.list(url, keyword);
     const b = FinderTools.budget(st);
     ctx.hooks.onAction(res.ok ? `🔗 已列出链接清单（${res.items.length} 条）` : '🔗 列链接清单失败');
-    const capped = res.items.slice(0, 120);
+    const capped = res.items.slice(0, MAX_LINKS_REPLY);
+    let note = res.note;
+    if (res.items.length > capped.length) {
+      // 回包自描述：截断必须说清还剩多少、怎么拿到，否则模型会拿半份目录当全量
+      note = `${note}。注意：清单被截断——共 ${res.items.length} 条，只返回了前 ${capped.length} 条，` +
+        `剩下的条目这次没有给。用 keyword 按标题换词分批拉取，或改用 html_to_book 直接传目录页链接（它会自动展开全部章节）`;
+    }
     const payload: LinksReply = {
       status: res.ok ? 'ok' : 'failed',
       note: res.note,
       count: res.items.length,
       links: capped,
+      steps_left: b.steps_left,
+      hint: b.hint
+    };
+    return JSON.stringify(payload);
+  }
+
+  /**
+   * check_pending：待入库区 + 书架的真实状态。
+   * 模型对「抓过什么」的记忆会随对话压缩衰减，任务卡只是摘要不是账本——
+   * 跨回合判断（要不要抓、抓到哪了）以这里的查询结果为准。
+   */
+  private static async checkPendingList(ctx: FinderCtx, st: FinderState): Promise<string> {
+    const b = FinderTools.budget(st);
+    const pend = await PendingStore.list(ctx.ui);
+    const works = await WorkDao.list();
+    const pending: PendingBrief[] = [];
+    for (let i = 0; i < pend.length && i < 50; i++) {
+      const it = pend[i];
+      pending.push({
+        title: it.title, author: it.author, chapters: it.chapters,
+        source_url: it.sourceUrl.length > 0 ? it.sourceUrl : ''
+      });
+    }
+    const shelf: ShelfBrief[] = [];
+    for (let i = 0; i < works.length && i < 100; i++) {
+      const w = works[i];
+      shelf.push({ title: w.title, author: w.author, chapters: w.chapterCount });
+    }
+    ctx.hooks.onAction(`📋 待入库 ${pend.length} 条，书架 ${works.length} 本`);
+    const payload: PendingReply = {
+      status: 'ok',
+      pending_count: pend.length,
+      shelf_count: works.length,
+      pending: pending,
+      shelf: shelf,
+      note: `待入库区 ${pend.length} 条、书架 ${works.length} 本（各只列前一部分）。判断重复或补章前先对照这份清单`,
       steps_left: b.steps_left,
       hint: b.hint
     };
@@ -1183,7 +1317,11 @@ export class FinderTools {
       const keyHit = key.length > 0 && it.author.length > 0 &&
         Dedupe.keyOf(it.title, it.author) === key;
       if (urlHit || keyHit) {
-        if (newChapters > 0 && it.chapters > 0 && newChapters > it.chapters) {
+        // URL 精确命中时 >= 即可覆盖（同源重抓：旧条目有毛病要换新的，或补抓后章数持平）；
+        // 待入库条目还没入库、没有译文/进度，覆盖无损。key 命中（不同来源同书）
+        // 维持严格 >，防止别的站抓的同名书把旧版冲掉。
+        const coverable = urlHit && newChapters > 0 && it.chapters > 0 && newChapters >= it.chapters;
+        if (newChapters > 0 && it.chapters > 0 && (newChapters > it.chapters || coverable)) {
           await PendingStore.remove(ctx.ui, it);
           ctx.hooks.onAction(`　　待入库区已有旧版（${it.chapters} 章），本次规模更大（${newChapters}），清掉旧版重抓`);
           return null;

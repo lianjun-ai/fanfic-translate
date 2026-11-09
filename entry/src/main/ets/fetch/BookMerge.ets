@@ -583,14 +583,21 @@ export class BookMerge {
     }
     const set = new Set<number>();
     let max = 0;
+    let min = nos[0];
     for (let i = 0; i < nos.length; i++) {
       set.add(nos[i]);
       if (nos[i] > max) {
         max = nos[i];
       }
+      if (nos[i] < min) {
+        min = nos[i];
+      }
     }
+    // 从最小章号数起，不从 1 数起：有的站点首章编号就不是 1（作者删过第 1 章、
+    // 站方编号不回填，如话本《东方神娃》整本 2–156），从 1 数会永远误报「缺 1」，
+    // 把模型推去补一个根本不存在的章。头部真缺章由「章数对比」兜底，不靠这里。
     const missing: number[] = [];
-    for (let i = 1; i <= max && missing.length < 15; i++) {
+    for (let i = min; i <= max && missing.length < 15; i++) {
       if (!set.has(i)) {
         missing.push(i);
       }
