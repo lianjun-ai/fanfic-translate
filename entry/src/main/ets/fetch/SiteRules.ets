@@ -35,6 +35,11 @@ export interface SiteRule {
   selector: string;
   /** 无标题时取首段前 40 字当书名（LOFTER 帖子常态） */
   titleFromFirstParagraph: boolean;
+  /**
+   * 专用处理器名（可选）：selector/JSON 表达不了的结构（如 ihuaben 的
+   * name/talkcontent 配对对话体）由代码实现，规则表只记用哪个处理器。
+   */
+  processor?: string;
   note: string;
   builtin: boolean;
 }
@@ -96,6 +101,18 @@ const BUILTIN_RULES: SiteRule[] = [
     urlPattern: 'tieba.baidu.com', marker: '', jsonTitle: '', jsonContent: '',
     selector: 'all:div.d_post_content', titleFromFirstParagraph: false,
     note: '百度贴吧帖子（d_post_content 容器）', builtin: true
+  },
+  {
+    // 话本小说（ihuaben.com）：对话体章节，正文是 前言(.discription>p.dp)、
+    // 对话块(div.talk > div.talkcontent > div.name + p 台词) 和旁白(p.dp)。
+    // 通用解析会把「角色名」和「台词」拆成两个段落，配对关系丢失；
+    // 专用处理器把每个对话块转写成「角色名：台词」，图片消息标注占位。
+    // 注意：目录页/章节页都命中 ihuaben.com/book/ 前缀，目录页交给
+    // html_to_book 的目录展开（在进正文抽取之前就被展开掉了）。
+    urlPattern: 'ihuaben.com/book/', marker: '', jsonTitle: '', jsonContent: '',
+    selector: '', titleFromFirstParagraph: false,
+    processor: 'ihuaben_talk',
+    note: '话本小说章节（对话体）', builtin: true
   }
 ];
 
@@ -222,8 +239,24 @@ export class SiteRules {
   }
 
   static allRules(): SiteRule[] {
-    // 用户规则在前：同 urlPattern 时用户改过的优先于内置
-    return SiteRules.loadUserRules().concat(BUILTIN_RULES);
+    // 顺序即优先级（matchAll 逐条试，第一条命中就用）：
+    // ① 带 processor 的内置规则 —— 代码级适配，比任何 selector 规则都准，
+    //    也让用户以前写坏的粗粒度规则没机会截胡（ihuaben 曾被一条
+    //    titleFromFirstParagraph 的用户规则抢先命中，章名全变成正文首段）；
+    // ② 用户规则 —— 仍然覆盖没有 processor 的内置规则（改站点的抽取方式）；
+    // ③ 其余内置规则。
+    const user = SiteRules.loadUserRules();
+    const proc: SiteRule[] = [];
+    const rest: SiteRule[] = [];
+    for (let i = 0; i < BUILTIN_RULES.length; i++) {
+      const r = BUILTIN_RULES[i];
+      if (r.processor !== undefined && r.processor.length > 0) {
+        proc.push(r);
+      } else {
+        rest.push(r);
+      }
+    }
+    return proc.concat(user).concat(rest);
   }
 
   static match(url: string): SiteRule | null {
@@ -272,6 +305,13 @@ export class SiteRules {
   }
 
   static extractWithRule(text: string, rule: SiteRule): SiteRuleHit | null {
+    // 专用处理器优先：selector/JSON 表达不了的结构化页面（对话体等）
+    if (rule.processor !== undefined && rule.processor.length > 0) {
+      const hit = SiteRules.fromProcessor(text, rule);
+      if (hit !== null) {
+        return hit;
+      }
+    }
     // jsonContent 有值就试 JSON 抽取：接口响应靠整份解析，页面靠 marker 定位，
     // 两种情况都走 fromEmbeddedJson（里面按顺序试两个根对象）。
     if (rule.jsonContent.length > 0) {
@@ -287,6 +327,136 @@ export class SiteRules {
       }
     }
     return null;
+  }
+
+  /** 专用处理器分发：每个处理器负责一种「规则表表达不了」的页面结构 */
+  private static fromProcessor(text: string, rule: SiteRule): SiteRuleHit | null {
+    if (rule.processor === 'ihuaben_talk') {
+      return SiteRules.ihuabenTalk(text, rule);
+    }
+    return null;
+  }
+
+  /**
+   * 话本小说（ihuaben.com）对话体章节。
+   *
+   * DOM：#contentsource 下按文档顺序混排 div.discription（前言）、div.talk
+   * （> div.avatar 头像 + div.talkcontent > div.name 说话人 + p 台词）和
+   * p.dp（旁白）。i.num 是空字数标记，直接被「无文本不收录」滤掉。
+   * 目录页没有 #contentsource，返回 null 让后面的规则和通用解析兜底。
+   */
+  private static ihuabenTalk(text: string, rule: SiteRule): SiteRuleHit | null {
+    const root = HtmlParser.parse(text);
+    const cs = SiteRules.querySelectorAll(root, '#contentsource');
+    if (cs.length === 0) {
+      return null;
+    }
+    const out: ParsedParagraph[] = [];
+    SiteRules.walkIhuaben(cs[0], out);
+    if (out.length === 0) {
+      return null;
+    }
+    // 章题在页面 h1。不能把标题选择权让给 pageTitle：它的回退链是
+    // <title> → og:title → h1，而本站 <title> 是「章题-《书名》第N章-作者-话本小说」
+    // 的长串，非空就会被整串当章名 —— 章题是对话体正文的开头，目录就成了正文截断。
+    let title = XhtmlConverter.firstHeadingText(root);
+    // 话本的章题不带章号，但 <title> 里有（…第N章-作者-…）。目录排序、
+    // 补章插位、章节索引都靠「第N章」，所以章号从这里补上。
+    if (title.length > 0 && !/第[0-9一二三四五六七八九十百千零两]+章/.test(title)) {
+      const tNode = HtmlParser.findFirst(root, 'title');
+      if (tNode !== null) {
+        const m = /第([0-9]+)章/.exec(HtmlParser.textOf(tNode));
+        if (m !== null && m.length > 1) {
+          title = `第${m[1]}章 ${title}`;
+        }
+      }
+    }
+    Log.i(`站点规则命中「${rule.note}」（对话体，${out.length} 段）：${title.length > 0 ? title : '（无标题）'}`);
+    return { rule: rule, title: title, paragraphs: out };
+  }
+
+  /** ihuaben：按文档顺序下钻，对话块/旁白就地消化，其余容器继续找 */
+  private static walkIhuaben(node: HtmlNode, out: ParsedParagraph[]): void {
+    if (node.isText) {
+      return;
+    }
+    const cls = node.attr('class');
+    if (node.tag === 'div' && SiteRules.hasClass(cls, 'talk')) {
+      SiteRules.appendTalkBlock(node, out);
+      return;
+    }
+    if (node.tag === 'p' && SiteRules.hasClass(cls, 'dp')) {
+      const paras = XhtmlConverter.toParagraphs(node);
+      for (let i = 0; i < paras.length; i++) {
+        if (SiteRules.firstText(paras[i]).trim().length > 0) {
+          out.push(paras[i]);
+        }
+      }
+      return;
+    }
+    // div.discription（前言）等容器继续下钻；里面同样是 p.dp
+    for (let i = 0; i < node.children.length; i++) {
+      SiteRules.walkIhuaben(node.children[i], out);
+    }
+  }
+
+  /**
+   * 一个对话块：div.name 是说话人，talkcontent 的其余子节点是台词。
+   * 首段台词加「角色名：」前缀，后续段接排；整块没有文字但有头像图
+   * （表情包/图片消息）时输出占位说明。
+   */
+  private static appendTalkBlock(talk: HtmlNode, out: ParsedParagraph[]): void {
+    const names = SiteRules.querySelectorAll(talk, 'div.name');
+    const name = names.length > 0 ? HtmlParser.textOf(names[0]).trim() : '';
+    const contents = SiteRules.querySelectorAll(talk, 'div.talkcontent');
+    let spoke = false;
+    if (contents.length > 0) {
+      const kids = contents[0].children;
+      for (let i = 0; i < kids.length; i++) {
+        const kid = kids[i];
+        if (!kid.isText && SiteRules.hasClass(kid.attr('class'), 'name')) {
+          continue;
+        }
+        // toParagraphs 只遍历 children，裸文本节点进去会得到空段落；
+        // 台词不经 <p> 包裹直接写在 talkcontent 里的章节要在这里兜住
+        let paras: ParsedParagraph[] = [];
+        if (kid.isText) {
+          const t = XhtmlConverter.normalizeSpace(kid.text).trim();
+          if (t.length > 0) {
+            paras = [SiteRules.textPara(t)];
+          }
+        } else {
+          paras = XhtmlConverter.toParagraphs(kid);
+        }
+        for (let j = 0; j < paras.length; j++) {
+          const t = SiteRules.firstText(paras[j]).trim();
+          if (t.length === 0) {
+            continue;
+          }
+          if (!spoke && name.length > 0) {
+            out.push(SiteRules.textPara(`${name}：${t}`));
+          } else {
+            out.push(paras[j]);
+          }
+          spoke = true;
+        }
+      }
+    }
+    if (!spoke && name.length > 0) {
+      out.push(SiteRules.textPara(`[${name} 发送了图片或表情]`));
+    }
+  }
+
+  private static hasClass(cls: string, want: string): boolean {
+    return cls.split(/\s+/).indexOf(want) >= 0;
+  }
+
+  /** 纯文本段落（对话转写、占位说明用） */
+  private static textPara(s: string): ParsedParagraph {
+    return {
+      type: ParaType.TEXT,
+      runs: [{ text: s, bold: false, italic: false, underline: false, strike: false }]
+    };
   }
 
   /**
