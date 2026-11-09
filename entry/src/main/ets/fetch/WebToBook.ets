@@ -42,6 +42,8 @@ export interface WebPageFetched {
   chars: number;
   /** 实际抓取的地址（镜像/接口替换后的），章节来源链接的上游 */
   url: string;
+  /** 直抓成功时的原始源码（供调用方做目录页识别等二次解析）；渲染兜底/接口路径拿不到就缺省 */
+  html?: string;
 }
 
 /** 拼接用的一章 */
@@ -123,6 +125,8 @@ export class WebToBook {
     }
     const direct = WebToBook.processHtml(text, '', target);
     if (direct.ok) {
+      // 原始源码随结果带回：html_to_book 靠它识别目录页（渲染兜底路径没有源码，缺省）
+      direct.html = text;
       return WebToBook.withPageHint(direct, text, target);
     }
     // 直抓空壳：多半是 JS 动态渲染，用隐藏 ArkWeb 真渲染一次
@@ -145,7 +149,8 @@ export class WebToBook {
     return {
       ok: out.ok,
       note: out.note.length > 0 ? `${out.note}；${hint}` : hint,
-      title: out.title, paragraphs: out.paragraphs, chars: out.chars, url: out.url
+      title: out.title, paragraphs: out.paragraphs, chars: out.chars, url: out.url,
+      html: out.html
     };
   }
 

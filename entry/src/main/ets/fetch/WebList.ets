@@ -25,8 +25,12 @@ type DwrObject = Map<string, string>;
 const PAGE_SIZE: number = 50;
 /** 最多翻几页，防止死循环（3 页 × 50 = 150 篇足够覆盖绝大多数博客） */
 const MAX_PAGES: number = 3;
-/** 通用链接清单上限 */
-const MAX_LINKS: number = 100;
+/** 通用链接清单上限（与 html_to_book 的 300 页安全阀对齐；超限时 listLinks 回包会说明截断） */
+const MAX_LINKS: number = 300;
+/** 目录页判定：与本页路径同前缀的站内链接达到这个数才算目录（导航栏凑不齐这个数） */
+const CATALOG_MIN_LINKS: number = 10;
+/** 单个目录页最多展开的内页数 */
+const CATALOG_MAX_LINKS: number = 300;
 
 /**
  * 网页链接清单引擎，供 list_links 工具使用。
@@ -296,6 +300,10 @@ export class WebList {
       let abs = '';
       if (href.startsWith('http://') || href.startsWith('https://')) {
         abs = href;
+      } else if (href.startsWith('//')) {
+        // 协议相对地址（//host/path，大量站点在用）：按 https 归一，否则会被
+        // 当成站内相对路径拼成 host//host/path 的畸形地址，host 校验侥幸通过
+        abs = 'https:' + href;
       } else if (href.startsWith('/') && origin.length > 0) {
         abs = origin + href;
       } else {
@@ -319,6 +327,83 @@ export class WebList {
       return { ok: false, note: '页面里没有找到站内链接（可能要登录、或内容由 JS 动态生成）', items: [] };
     }
     return { ok: true, note: `列出 ${items.length} 条站内链接`, items: items };
+  }
+
+  /**
+   * 目录页识别与展开（同步、纯解析，吃调用方已抓到的源码，不再发请求）。
+   *
+   * 目录页最强的特征不是「链接多」而是「内页链接和目录页在同一路径前缀下」：
+   * /book/3012090 下挂着一百多个 /book/3012090/{章节id}.html；而章节页自己的
+   * 前缀下只有它自己，再花哨的导航栏/推荐位也凑不够 CATALOG_MIN_LINKS 条。
+   * 用前缀特征还能把页脚的站内链接、其他书的推荐链接天然挡在外面。
+   *
+   * 返回按文档顺序排列的内页链接（去重、去掉目录页自身）；空数组=不是目录页。
+   */
+  static expandCatalog(html: string, url: string): string[] {
+    const path = WebList.pathNoExt(url);
+    if (path.length === 0) {
+      return [];
+    }
+    const root = HtmlParser.parse(html);
+    const nodes: HtmlNode[] = [];
+    HtmlParser.findAll(root, 'a', nodes);
+    const origin = WebList.originOf(url);
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (let i = 0; i < nodes.length; i++) {
+      const href = nodes[i].attrs.get('href');
+      if (href === undefined || href.length < 2 || href.startsWith('#') || href.indexOf('javascript:') === 0) {
+        continue;
+      }
+      let abs = '';
+      if (href.startsWith('http://') || href.startsWith('https://')) {
+        abs = href;
+      } else if (href.startsWith('//')) {
+        // 协议相对地址按 https 归一（同 anchors，畸形拼接会让前缀校验失效）
+        abs = 'https:' + href;
+      } else if (href.startsWith('/') && origin.length > 0) {
+        abs = origin + href;
+      } else {
+        continue;
+      }
+      if (WebList.hostOf(abs) !== WebList.hostOf(url)) {
+        continue;
+      }
+      const linkPath = WebList.pathNoExt(abs);
+      // 必须真的以前缀开头才谈得上「同前缀」；直接 substring 会把不含前缀的
+      // 链接切出错位片段放进 rest，导航/外站链接就混进来了
+      if (!linkPath.startsWith(path)) {
+        continue;
+      }
+      const rest = linkPath.substring(path.length);
+      // rest 为空 = 就是目录页自己（/book/x 与 /book/x.html 归一后相等）；
+      // rest 以数字开头 = 前缀巧合撞上的另一个 id（/book/301209 与 /book/3012091）
+      if (rest.length === 0 || /^[0-9]/.test(rest.charAt(0))) {
+        continue;
+      }
+      if (seen.has(abs)) {
+        continue;
+      }
+      const text = HtmlParser.textOf(nodes[i]).trim();
+      if (text.length === 0) {
+        continue;
+      }
+      seen.add(abs);
+      out.push(abs);
+      if (out.length >= CATALOG_MAX_LINKS) {
+        break;
+      }
+    }
+    return out.length >= CATALOG_MIN_LINKS ? out : [];
+  }
+
+  /** URL 的路径部分，归一化：去掉末尾扩展名与斜杠（/book/x.html ≡ /book/x） */
+  private static pathNoExt(url: string): string {
+    const m = /^https?:\/\/[^/]+(\/[^?#]*)/.exec(url);
+    if (m === null || m.length < 2) {
+      return '';
+    }
+    return m[1].replace(/\.(x?html|shtml|php|aspx?)$/i, '').replace(/\/$/, '');
   }
 
   private static originOf(url: string): string {
