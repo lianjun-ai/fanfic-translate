@@ -41,6 +41,12 @@ export interface PendingItem {
    * 一切相关逻辑都要按「没有就降级」处理，不阻断主流程。
    */
   chapterIndex?: ChapterRef[];
+  /**
+   * 抓取失败、还没有拿到正文的章节链接（跨回合续跑的依据）：
+   * 模型 check_pending 查到它，就能在下个回合用 add_chapters 补抓，
+   * 不用靠对话记忆记住哪几页失败。补上的链接会被移除。旧边车缺省。
+   */
+  failedUrls?: string[];
 }
 
 export class PendingStore {
@@ -56,7 +62,7 @@ export class PendingStore {
    * 边车不搬文件，待入库列表永远是空的。所以这里必须 copy 进 filesDir。
    */
   static async save(ctx: common.UIAbilityContext, meta: FicMeta, epubPath: string,
-    chapterIndex?: ChapterRef[]): Promise<PendingItem> {
+    chapterIndex?: ChapterRef[], failedUrls?: string[]): Promise<PendingItem> {
     const dir = PendingStore.dirOf(ctx);
     if (!fs.accessSync(dir)) {
       fs.mkdirSync(dir, true);
@@ -82,6 +88,9 @@ export class PendingStore {
     };
     if (chapterIndex !== undefined && chapterIndex.length > 0) {
       item.chapterIndex = chapterIndex;
+    }
+    if (failedUrls !== undefined && failedUrls.length > 0) {
+      item.failedUrls = failedUrls;
     }
     const sidecar = `${dest}.json`;
     const f = fs.openSync(sidecar, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);

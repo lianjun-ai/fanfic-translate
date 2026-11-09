@@ -163,6 +163,10 @@ interface PendingBrief {
   author: string;
   chapters: number;
   source_url: string;
+  /** 抓取失败未入库的章节链接（前 5 条）；没有失败页时缺省 */
+  failed_urls?: string[];
+  /** 失败页总数（可能多于 failed_urls 列出的条数） */
+  failed_count?: number;
 }
 
 interface ShelfBrief {
@@ -226,7 +230,7 @@ export class FinderTools {
     if (left <= 0) {
       hint = '步数已用尽，不要再调用任何工具，立刻把手上已有的结果整理成最终回复交给用户。';
     } else if (left <= ROUNDS_WARN_AT) {
-      hint = `只剩 ${left} 步，不要再开新线索了：优先把已确认的作品拿到手，然后收尾。`;
+      hint = `只剩 ${left} 步，不要再开新线索了：优先把已确认的作品拿到手，然后收尾。抓书没抓完的别硬撑，失败链接已记在待入库条目里，下回合 check_pending 查到就能接着抓。`;
     }
     return { steps_left: left, hint: hint };
   }
@@ -332,7 +336,7 @@ export class FinderTools {
       type: 'function',
       function: {
         name: 'check_pending',
-        description: '查看待入库区和书架的真实状态：待入库条目（书名/作者/章数/来源链接）和书架作品概要（书名/作者/章数）。判断「这本是不是已经抓过、抓到了哪一章、书架上还有什么」时调它，不要凭对话记忆猜——查重工具只拦单次抓取，跨回合的判断靠这个',
+        description: '查看待入库区和书架的真实状态：待入库条目（书名/作者/章数/来源链接）和书架作品概要（书名/作者/章数）。判断「这本是不是已经抓过、抓到了哪一章、书架上还有什么」时调它，不要凭对话记忆猜——查重工具只拦单次抓取，跨回合的判断靠这个。待入库条目若带 failed_urls（抓取失败的章节链接），用它作 sources 调 add_chapters 就能接着抓',
         parameters: JSON.parse('{"type":"object","properties":{}}')
       }
     };
@@ -624,6 +628,8 @@ export class FinderTools {
     const dir = `${ctx.ui.cacheDir}/finder_dl`;
     const pages: WebPageFetched[] = [];
     const failedNotes: string[] = [];
+    /** 抓取失败的请求地址，原样进边车 failedUrls —— 跨回合补抓的依据 */
+    const failedUrls: string[] = [];
     const expandedNotes: string[] = [];
     let totalChars = 0;
     // 队列式抓取：目录页在原地展开成内页链接插回队列，阅读顺序不乱。
@@ -668,6 +674,7 @@ export class FinderTools {
         ctx.hooks.onAction(`　　第 ${pages.length} 页「${p.title.length > 0 ? p.title : pageUrl}」：约 ${p.chars} 字${p.note.length > 0 ? `（${p.note}）` : ''}`);
       } else {
         failedNotes.push(`「${pageUrl}」：${p.note}`);
+        failedUrls.push(pageUrl);
         ctx.hooks.onAction(`　　「${pageUrl}」抓取失败：${p.note}`);
       }
     }
@@ -759,7 +766,7 @@ export class FinderTools {
       return FinderTools.reply('exists', FinderTools.dupNote(dup), meta, '', st);
     }
     try {
-      const item: PendingItem = await PendingStore.save(ctx.ui, meta, path, chapterIndex);
+      const item: PendingItem = await PendingStore.save(ctx.ui, meta, path, chapterIndex, failedUrls);
       st.hits.push(meta);
       st.downloaded.push(item);
       ctx.hooks.onHit(meta);
@@ -769,7 +776,7 @@ export class FinderTools {
         ? `${failedNotes.slice(0, 5).join('；')}（另有 ${failedNotes.length - 5} 个页面同样失败，从略）`
         : failedNotes.join('；');
       let note = failedNotes.length > 0
-        ? `已放进待入库区（${failedNotes.length} 个页面抓取失败：${failBrief}）`
+        ? `已放进待入库区（${failedNotes.length} 个页面抓取失败：${failBrief}）。失败页链接已记在这本待入库条目里，本回合接着用 add_chapters（target=这本书，sources=失败链接）补抓，或留给之后的回合（check_pending 能查到 failed_urls）`
         : '已放进待入库区，用户确认后才会进书架';
       if (expandedNotes.length > 0) {
         note = `${note}。目录页已自动展开：${expandedNotes.join('；')}——书按展开后的完整目录合成，不用再补传章节链接`;
@@ -1140,10 +1147,17 @@ export class FinderTools {
     const pending: PendingBrief[] = [];
     for (let i = 0; i < pend.length && i < 50; i++) {
       const it = pend[i];
-      pending.push({
+      const brief: PendingBrief = {
         title: it.title, author: it.author, chapters: it.chapters,
         source_url: it.sourceUrl.length > 0 ? it.sourceUrl : ''
-      });
+      };
+      // 失败链接是「接着抓」的抓手：模型看到它就知道补抓哪几个，
+      // 不用靠上一回合的对话记忆（早被压缩没了）
+      if (it.failedUrls !== undefined && it.failedUrls.length > 0) {
+        brief.failed_count = it.failedUrls.length;
+        brief.failed_urls = it.failedUrls.slice(0, 5);
+      }
+      pending.push(brief);
     }
     const shelf: ShelfBrief[] = [];
     for (let i = 0; i < works.length && i < 100; i++) {

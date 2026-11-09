@@ -209,9 +209,12 @@ export class BookMerge {
     onProgress('正在合成一本…');
     const workTitle = titleArg.length > 0 ? titleArg : target.title;
     const workAuthor = authorArg.length > 0 ? authorArg : target.author;
+    // 失败链接过账：目标/来源条目里记着上次没抓到的页，本次真补进来的清掉，
+    // 剩下的跟着新条目走 —— 跨回合「接着抓」的账本不能在合并时丢
+    const remaining = BookMerge.remainingFailed(target, sourceItems, norm.chapters);
     const item = await BookMerge.writePending(ctx, workTitle, workAuthor,
       `合并 ${1 + sourceItems.length} 本${norm.dropped > 0 ? ` · 去掉 ${norm.dropped} 章重复` : ''}`,
-      target.sourceUrl, norm.chapters, onProgress);
+      target.sourceUrl, norm.chapters, onProgress, remaining);
 
     if (!keepOriginals) {
       await PendingStore.remove(ctx, target);
@@ -521,7 +524,7 @@ export class BookMerge {
   /** 待入库落盘：序列化 + 边车（带章节清单） */
   private static async writePending(ctx: common.UIAbilityContext, title: string, author: string,
     info: string, sourceUrl: string, chapters: ParsedChapter[],
-    onProgress: (msg: string) => void): Promise<PendingItem> {
+    onProgress: (msg: string) => void, failedUrls?: string[]): Promise<PendingItem> {
     const list: WebChapter[] = [];
     let chars = 0;
     const refs: ChapterRef[] = [];
@@ -561,7 +564,59 @@ export class BookMerge {
       epubUrl: '',
       sourceUrl: sourceUrl
     };
-    return PendingStore.save(ctx, meta, path, refs);
+    return PendingStore.save(ctx, meta, path, refs, failedUrls);
+  }
+
+  /**
+   * 合并后的失败链接清单：目标与来源条目 failedUrls 的并集，
+   * 去掉本次真正补进来的章（URL 归一后比对）。模型传的补抓链接可能与
+   * 记录的串不完全一致（多/少 .html 后缀、尾斜杠），所以归一后再比。
+   */
+  private static remainingFailed(target: PendingItem, sourceItems: PendingItem[],
+    added: ParsedChapter[]): string[] {
+    const ok = new Set<string>();
+    for (let i = 0; i < added.length; i++) {
+      const u = BookMerge.urlOf(added[i]);
+      if (u.length > 0) {
+        ok.add(BookMerge.normUrl(u));
+      }
+    }
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const push = (raw: string): void => {
+      if (raw.length === 0) {
+        return;
+      }
+      const key = BookMerge.normUrl(raw);
+      if (ok.has(key) || seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      out.push(raw);
+    };
+    if (target.failedUrls !== undefined) {
+      for (let i = 0; i < target.failedUrls.length; i++) {
+        push(target.failedUrls[i]);
+      }
+    }
+    for (let i = 0; i < sourceItems.length; i++) {
+      const fu = sourceItems[i].failedUrls;
+      if (fu !== undefined) {
+        for (let j = 0; j < fu.length; j++) {
+          push(fu[j]);
+        }
+      }
+    }
+    return out;
+  }
+
+  /** URL 轻归一：去 query/hash、去尾斜杠，供失败链接过账比对 */
+  private static normUrl(u: string): string {
+    let s = u.split('#')[0].split('?')[0];
+    while (s.length > 0 && s.charAt(s.length - 1) === '/') {
+      s = s.substring(0, s.length - 1);
+    }
+    return s;
   }
 
   /**
